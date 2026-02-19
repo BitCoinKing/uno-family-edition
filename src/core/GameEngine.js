@@ -285,7 +285,7 @@ export class GameEngine {
     if (starter.value === "reverse") {
       game.direction *= -1;
       if (game.players.length === 2) {
-        game.currentTurn = this.nextTurnIndex(game, 1);
+        game.currentTurn = this.nextTurnIndex(game, 2);
       }
     }
     if (starter.value === "draw2") {
@@ -388,6 +388,9 @@ export class GameEngine {
     const card = player.hand[cardIndex];
     if (!this.isPlayable(card, game)) {
       return { ok: false, error: "Card is not playable." };
+    }
+    if (card.type === "wild" && !declaredColor) {
+      return { ok: false, error: "Choose a color first." };
     }
 
     player.hand.splice(cardIndex, 1);

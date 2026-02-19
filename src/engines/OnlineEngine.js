@@ -53,9 +53,7 @@ export class OnlineEngine {
     this.localBroadcastRef = `ref_${Math.random().toString(36).slice(2, 10)}`;
     this.autoStartInFlight = false;
     this.pullRoomStateInFlight = false;
-    this.activeStatePullTimer = null;
     this.uiStatusTimer = null;
-    this.activeTransitionTimer = null;
 
     this.eventBus.on("auth:changed", async () => {
       await this.refreshLobby();
@@ -66,6 +64,10 @@ export class OnlineEngine {
   setClient(supabase) {
     this.supabase = supabase;
     this.patchSetup({ enabled: !!supabase });
+  }
+
+  getRoomVersion() {
+    return this.activeRoom?.version ?? 0;
   }
 
   patchSetup(patch) {
@@ -162,7 +164,12 @@ export class OnlineEngine {
 
     this.patchSetup({ localDisplayName: preferred });
     const code = online.pendingInviteCode;
-    const result = await this.joinRoom({ roomCode: code, displayName: preferred });
+    const result = online.pendingInviteToken
+      ? await this.joinRoomByInviteToken({
+          inviteToken: online.pendingInviteToken,
+          displayName: preferred,
+        })
+      : await this.joinRoom({ roomCode: code, displayName: preferred });
 
     if (result.ok) {
       this.patchSetup({ pendingInviteCode: "", pendingInviteToken: "" });
@@ -172,6 +179,14 @@ export class OnlineEngine {
       this.patchSetup({ pendingInviteError: result.error || "Invite join failed." });
       this.eventBus.emit("online:autojoin-failed", { error: result.error || "Invite join failed." });
     }
+  }
+
+  async joinRoomByInviteToken({ inviteToken, displayName }) {
+    const roomCode = decodeInviteToken((inviteToken || "").trim());
+    if (!roomCode) {
+      return { ok: false, error: "Invalid invite token." };
+    }
+    return this.joinRoom({ roomCode, displayName });
   }
 
   clearInviteParamsFromLocation() {
@@ -359,11 +374,8 @@ export class OnlineEngine {
     });
 
     if (snapshot?.room?.status !== "active") {
-      this.setTransientUiStatus("Joined ✅ Waiting for host…", 900);
-    }
-
-    if (snapshot?.room?.status === "active") {
-      this.setTransientUiStatus("Starting match…", 500);
+      this.setTransientUiStatus("Joined ✅ Waiting for host…", 800);
+    } else {
       await this.pullRoomState(room.id);
     }
 
@@ -383,7 +395,7 @@ export class OnlineEngine {
 
     const { data: room } = await this.supabase
       .from("game_rooms")
-      .select("status, expected_players, host_user_id, code")
+      .select("status, expected_players, host_user_id, code, version")
       .eq("id", online.roomId)
       .single();
 
@@ -391,6 +403,9 @@ export class OnlineEngine {
     this.syncSetupForExpectedPlayers(expectedPlayers);
 
     const user = this.authManager.getUser();
+    if (this.activeRoom && room) {
+      this.activeRoom.version = room.version ?? this.activeRoom.version ?? 0;
+    }
     this.patchSetup({
       lobbyPlayers: players || [],
       status: room?.status || online.status,
@@ -492,72 +507,29 @@ export class OnlineEngine {
     if (this.channel && this.supabase) {
       await this.supabase.removeChannel(this.channel);
     }
-    if (this.activeStatePullTimer) {
-      clearTimeout(this.activeStatePullTimer);
-      this.activeStatePullTimer = null;
-    }
     if (this.uiStatusTimer) {
       clearTimeout(this.uiStatusTimer);
       this.uiStatusTimer = null;
-    }
-    if (this.activeTransitionTimer) {
-      clearTimeout(this.activeTransitionTimer);
-      this.activeTransitionTimer = null;
     }
     this.channel = null;
     this.activeRoom = null;
   }
 
   async onRoomUpdated(room) {
-    const state = this.stateManager.getState();
-    const previousStatus = state.setup.online.status;
-    const becameActive = previousStatus !== "active" && room.status === "active";
-
     if (this.activeRoom && this.activeRoom.id === room.id) {
-      this.activeRoom.version = room.version || this.activeRoom.version || 0;
+      this.activeRoom.version = room.version ?? this.activeRoom.version ?? 0;
     }
     this.patchSetup({ status: room.status, roomCode: room.code, expectedPlayers: room.expected_players });
     this.syncSetupForExpectedPlayers(room.expected_players);
 
-    if (becameActive) {
-      this.setTransientUiStatus("Starting match…", 500);
-    }
-
-    if (room.game_state) {
-      const shouldDelayTransition = becameActive && state.screen !== "game";
-      if (shouldDelayTransition) {
-        if (this.activeTransitionTimer) {
-          clearTimeout(this.activeTransitionTimer);
-        }
-        this.activeTransitionTimer = setTimeout(() => {
-          this.activeTransitionTimer = null;
-          this.gameEngine.applyRemoteGameState(room.game_state, "game:synced");
-        }, 420);
-      } else {
-        if (this.activeTransitionTimer) {
-          clearTimeout(this.activeTransitionTimer);
-          this.activeTransitionTimer = null;
-        }
-        this.gameEngine.applyRemoteGameState(room.game_state, "game:synced");
-      }
+    if (room.status === "active" && room.game_state) {
+      this.gameEngine.applyRemoteGameState(room.game_state, "game:synced");
       return;
     }
 
     if (room.status === "active") {
-      this.scheduleActiveStatePull(becameActive ? 420 : 150);
+      await this.pullRoomState(room.id);
     }
-  }
-
-  scheduleActiveStatePull(delayMs = 150) {
-    if (this.activeStatePullTimer) {
-      clearTimeout(this.activeStatePullTimer);
-    }
-    this.activeStatePullTimer = setTimeout(async () => {
-      this.activeStatePullTimer = null;
-      const roomId = this.stateManager.getState().setup.online.roomId || this.activeRoom?.id;
-      if (!roomId) return;
-      await this.pullRoomState(roomId);
-    }, delayMs);
   }
 
   async onMoveIntent(payload) {
@@ -576,11 +548,45 @@ export class OnlineEngine {
   onIntentRejected(payload) {
     const body = payload.payload || {};
     const localUserId = this.authManager.getUser()?.id;
-    if (!body?.error || !localUserId) return;
+    if (!localUserId) return;
     if (body.actorUserId && body.actorUserId !== localUserId) return;
 
+    if (body.reason === "stale_client") {
+      const expectedVersion = Number(body.expectedVersion);
+      if (Number.isFinite(expectedVersion) && this.activeRoom) {
+        this.activeRoom.version = expectedVersion;
+      }
+      this.eventBus.emit("online:intent-rejected", {
+        reason: "stale_client",
+        expectedVersion: Number.isFinite(expectedVersion) ? expectedVersion : null,
+        error: body.error || "Resync required.",
+      });
+      const roomId = this.stateManager.getState().setup.online.roomId || this.activeRoom?.id;
+      if (roomId) {
+        this.pullRoomState(roomId);
+      }
+      return;
+    }
+
     this.eventBus.emit("online:intent-rejected", {
-      error: body.error,
+      reason: body.reason || "invalid_move",
+      error: body.error || "Move rejected.",
+    });
+  }
+
+  async broadcastIntentRejected(actorUserId, payload = {}) {
+    if (!actorUserId || !this.channel) return;
+    await this.channel.send({
+      type: "broadcast",
+      event: "intent_rejected",
+      payload: {
+        actorUserId,
+        ref: payload.ref || null,
+        reason: payload.reason || "invalid_move",
+        expectedVersion: payload.expectedVersion ?? null,
+        error: payload.error || "Move rejected.",
+        at: Date.now(),
+      },
     });
   }
 
@@ -588,6 +594,21 @@ export class OnlineEngine {
     const state = this.stateManager.getState();
     const game = state.game;
     if (!game) return;
+
+    const hostRoomVersion = this.getRoomVersion();
+    const clientRoomVersion = Number.isFinite(Number(intent.clientRoomVersion))
+      ? Number(intent.clientRoomVersion)
+      : -1;
+
+    if (clientRoomVersion < hostRoomVersion) {
+      await this.broadcastIntentRejected(intent.actorUserId, {
+        ref: intent.ref || null,
+        reason: "stale_client",
+        expectedVersion: hostRoomVersion,
+        error: "Client state is stale. Resyncing...",
+      });
+      return { ok: false, error: "Client state is stale." };
+    }
 
     let result = { ok: false };
 
@@ -608,43 +629,59 @@ export class OnlineEngine {
     }
 
     if (!result.ok) {
-      const actorUserId = intent.actorUserId || null;
-      if (actorUserId && this.channel) {
-        await this.channel.send({
-          type: "broadcast",
-          event: "intent_rejected",
-          payload: {
-            actorUserId,
-            ref: intent.ref || null,
-            error: result.error || "Move rejected.",
-            at: Date.now(),
-          },
-        });
-      }
+      await this.broadcastIntentRejected(intent.actorUserId, {
+        ref: intent.ref || null,
+        reason: "invalid_move",
+        error: result.error || "Move rejected.",
+      });
       return result;
     }
 
-    await this.pushGameState();
+    const pushed = await this.pushGameState();
+    if (!pushed.ok) {
+      await this.broadcastIntentRejected(intent.actorUserId, {
+        ref: intent.ref || null,
+        reason: "invalid_move",
+        error: pushed.error || "Could not sync game state.",
+      });
+      return { ok: false, error: pushed.error || "Could not sync game state." };
+    }
     return result;
   }
 
   async pushGameState() {
-    if (!this.supabase || !this.activeRoom) return;
+    if (!this.supabase || !this.activeRoom) {
+      return { ok: false, error: "No active room." };
+    }
 
     const game = this.gameEngine.serializeCurrentGame();
-    if (!game) return;
+    if (!game) {
+      return { ok: false, error: "No active game." };
+    }
 
     const status = game.winnerId ? "finished" : "active";
-    await this.supabase
+    const nextVersion = (this.activeRoom.version ?? 0) + 1;
+    const { data, error } = await this.supabase
       .from("game_rooms")
       .update({
         game_state: game,
         status,
-        version: (this.activeRoom.version || 0) + 1,
+        version: nextVersion,
       })
-      .eq("id", this.activeRoom.id);
+      .eq("id", this.activeRoom.id)
+      .select("version, status, code")
+      .single();
 
-    this.activeRoom.version = (this.activeRoom.version || 0) + 1;
+    if (error) {
+      return { ok: false, error: error.message };
+    }
+
+    this.activeRoom.version = data?.version ?? nextVersion;
+    this.patchSetup({
+      status: data?.status || status,
+      roomCode: data?.code || this.stateManager.getState().setup.online.roomCode,
+    });
+    return { ok: true, version: this.activeRoom.version };
   }
 
   async pullRoomState(roomIdOverride = null) {
@@ -657,15 +694,21 @@ export class OnlineEngine {
     try {
       const { data: room } = await this.supabase
         .from("game_rooms")
-        .select("game_state, status")
+        .select("game_state, status, version, code")
         .eq("id", roomId)
         .single();
 
-      if (room?.game_state) {
-        if (this.activeTransitionTimer) {
-          clearTimeout(this.activeTransitionTimer);
-          this.activeTransitionTimer = null;
+      if (room) {
+        if (this.activeRoom && this.activeRoom.id === roomId) {
+          this.activeRoom.version = room.version ?? this.activeRoom.version ?? 0;
         }
+        this.patchSetup({
+          status: room.status || this.stateManager.getState().setup.online.status,
+          roomCode: room.code || this.stateManager.getState().setup.online.roomCode,
+        });
+      }
+
+      if (room?.game_state) {
         this.gameEngine.applyRemoteGameState(room.game_state, "game:synced");
       }
     } finally {
@@ -701,7 +744,10 @@ export class OnlineEngine {
     });
 
     if (!result.ok) return result;
-    await this.pushGameState();
+    const pushed = await this.pushGameState();
+    if (!pushed.ok) {
+      return { ok: false, error: pushed.error || "Could not sync online match." };
+    }
     return { ok: true };
   }
 
@@ -738,6 +784,9 @@ export class OnlineEngine {
     const payload = {
       ...intent,
       actorUserId: user?.id || null,
+      clientRoomVersion: Number.isFinite(Number(intent.clientRoomVersion))
+        ? Number(intent.clientRoomVersion)
+        : this.getRoomVersion(),
       ref: this.localBroadcastRef,
       at: Date.now(),
     };
@@ -754,15 +803,15 @@ export class OnlineEngine {
     return { ok: true };
   }
 
-  async requestPlay({ playerId, cardId, declaredColor }) {
-    return this.sendIntent({ type: "play", playerId, cardId, declaredColor });
+  async requestPlay({ playerId, cardId, declaredColor, clientRoomVersion }) {
+    return this.sendIntent({ type: "play", playerId, cardId, declaredColor, clientRoomVersion });
   }
 
-  async requestDraw({ playerId }) {
-    return this.sendIntent({ type: "draw", playerId });
+  async requestDraw({ playerId, clientRoomVersion }) {
+    return this.sendIntent({ type: "draw", playerId, clientRoomVersion });
   }
 
-  async requestPass({ playerId }) {
-    return this.sendIntent({ type: "pass", playerId });
+  async requestPass({ playerId, clientRoomVersion }) {
+    return this.sendIntent({ type: "pass", playerId, clientRoomVersion });
   }
 }
