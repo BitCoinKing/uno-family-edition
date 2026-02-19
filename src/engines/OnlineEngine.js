@@ -457,6 +457,7 @@ export class OnlineEngine {
         });
       })
       .on("broadcast", { event: "move_intent" }, (payload) => this.onMoveIntent(payload))
+      .on("broadcast", { event: "intent_rejected" }, (payload) => this.onIntentRejected(payload))
       ;
 
     await new Promise((resolve, reject) => {
@@ -572,6 +573,17 @@ export class OnlineEngine {
     await this.applyIntentAsHost(body);
   }
 
+  onIntentRejected(payload) {
+    const body = payload.payload || {};
+    const localUserId = this.authManager.getUser()?.id;
+    if (!body?.error || !localUserId) return;
+    if (body.actorUserId && body.actorUserId !== localUserId) return;
+
+    this.eventBus.emit("online:intent-rejected", {
+      error: body.error,
+    });
+  }
+
   async applyIntentAsHost(intent) {
     const state = this.stateManager.getState();
     const game = state.game;
@@ -595,9 +607,25 @@ export class OnlineEngine {
       result = this.gameEngine.endTurn(intent.playerId, "pass");
     }
 
-    if (result.ok) {
-      await this.pushGameState();
+    if (!result.ok) {
+      const actorUserId = intent.actorUserId || null;
+      if (actorUserId && this.channel) {
+        await this.channel.send({
+          type: "broadcast",
+          event: "intent_rejected",
+          payload: {
+            actorUserId,
+            ref: intent.ref || null,
+            error: result.error || "Move rejected.",
+            at: Date.now(),
+          },
+        });
+      }
+      return result;
     }
+
+    await this.pushGameState();
+    return result;
   }
 
   async pushGameState() {
@@ -705,15 +733,20 @@ export class OnlineEngine {
 
   async sendIntent(intent) {
     if (!this.channel) return { ok: false, error: "No active room channel." };
+    const user = this.authManager.getUser();
 
     const payload = {
       ...intent,
+      actorUserId: user?.id || null,
       ref: this.localBroadcastRef,
       at: Date.now(),
     };
 
     if (this.stateManager.getState().setup.online.isHost) {
-      await this.applyIntentAsHost(payload);
+      const result = await this.applyIntentAsHost(payload);
+      if (!result?.ok) {
+        return { ok: false, error: result?.error || "Move rejected." };
+      }
       return { ok: true };
     }
 

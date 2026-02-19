@@ -60,6 +60,9 @@ export class UIEngine {
     this.eventBus.on("online:autojoin-failed", (payload) => {
       if (this.nodes.error) this.nodes.error.textContent = payload.error;
     });
+    this.eventBus.on("online:intent-rejected", (payload) => {
+      if (payload?.error) this.showToast(payload.error);
+    });
 
     this.eventBus.on("game:feedback", (payload) => this.handleFeedback(payload));
     this.eventBus.on("game:turn", (payload) => this.handleTurn(payload));
@@ -532,35 +535,91 @@ export class UIEngine {
       this.leaveGameFlow();
     });
 
-    this.nodes.drawCard?.addEventListener("click", () => {
+    this.nodes.drawCard?.addEventListener("click", async () => {
       const game = this.stateManager.getState().game;
       if (!game || game.winnerId) return;
-      const player = game.players[game.currentTurn];
-      if (player.isAI) return;
-      if (!this.canLocalUserAct(player, game)) return;
 
       if (game.mode === "online") {
-        this.onlineEngine.requestDraw({ playerId: player.id });
-      } else {
-        this.gameEngine.drawCard(player.id, { passTurn: true });
+        const me = this.getLocalPlayer(game);
+        this.logOnlineTurnDebug(game, me);
+        if (!me) {
+          this.showToast("You are not seated in this room.");
+          return;
+        }
+        if (me.player.isAI) return;
+        if (me.index !== game.currentTurn) {
+          this.showToast("Not your turn.");
+          return;
+        }
+
+        const result = await this.onlineEngine.requestDraw({ playerId: me.player.id });
+        if (!result?.ok) {
+          this.showToast(result?.error || "Could not draw card.");
+        }
+        return;
+      }
+
+      const player = game.players[game.currentTurn];
+      if (!player || player.isAI) return;
+      const result = this.gameEngine.drawCard(player.id, { passTurn: true });
+      if (!result.ok) {
+        this.showToast(result.error || "Could not draw card.");
       }
     });
 
-    this.nodes.playersGrid?.addEventListener("click", (event) => {
+    this.nodes.playersGrid?.addEventListener("click", async (event) => {
       const cardNode = event.target.closest("[data-card-id]");
       if (!cardNode) return;
 
       const game = this.stateManager.getState().game;
       if (!game || game.winnerId) return;
 
-      const player = game.players[game.currentTurn];
-      if (player.isAI) return;
-      if (!this.canLocalUserAct(player, game)) return;
-
       const cardId = cardNode.dataset.cardId;
-      const card = player.hand.find((item) => item.id === cardId);
-      if (!card) return;
+      if (game.mode === "online") {
+        const me = this.getLocalPlayer(game);
+        this.logOnlineTurnDebug(game, me);
+        if (!me) {
+          this.showToast("You are not seated in this room.");
+          return;
+        }
+        if (me.player.isAI) return;
+        if (me.index !== game.currentTurn) {
+          this.showToast("Not your turn.");
+          return;
+        }
 
+        const card = me.player.hand.find((item) => item.id === cardId);
+        if (!card) {
+          this.showToast("Card not found in your hand.");
+          return;
+        }
+        if (!this.gameEngine.isPlayable(card, game)) {
+          this.showToast("That card cannot be played now.");
+          return;
+        }
+
+        if (card.type === "wild") {
+          this.pendingWild = { playerId: me.player.id, cardId };
+          this.openWildModal();
+          return;
+        }
+
+        this.animationEngine.flyCardToDiscard(cardNode, this.nodes.discardCard);
+        const result = await this.onlineEngine.requestPlay({ playerId: me.player.id, cardId });
+        if (!result?.ok) {
+          this.showToast(result?.error || "Could not play card.");
+        }
+        return;
+      }
+
+      const player = game.players[game.currentTurn];
+      if (!player || player.isAI) return;
+
+      const card = player.hand.find((item) => item.id === cardId);
+      if (!card) {
+        this.showToast("Card not found in hand.");
+        return;
+      }
       if (!this.gameEngine.isPlayable(card, game)) {
         this.showToast("That card cannot be played now.");
         return;
@@ -573,14 +632,13 @@ export class UIEngine {
       }
 
       this.animationEngine.flyCardToDiscard(cardNode, this.nodes.discardCard);
-      if (game.mode === "online") {
-        this.onlineEngine.requestPlay({ playerId: player.id, cardId });
-      } else {
-        this.gameEngine.playCard({ playerId: player.id, cardId });
+      const result = this.gameEngine.playCard({ playerId: player.id, cardId });
+      if (!result.ok) {
+        this.showToast(result.error || "Could not play card.");
       }
     });
 
-    this.nodes.wildModal?.addEventListener("click", (event) => {
+    this.nodes.wildModal?.addEventListener("click", async (event) => {
       const button = event.target.closest("[data-wild-color]");
       if (!button || !this.pendingWild) return;
 
@@ -589,17 +647,23 @@ export class UIEngine {
       this.closeWildModal();
       const game = this.stateManager.getState().game;
       if (game?.mode === "online") {
-        this.onlineEngine.requestPlay({
+        const result = await this.onlineEngine.requestPlay({
           playerId,
           cardId,
           declaredColor: button.dataset.wildColor,
         });
+        if (!result?.ok) {
+          this.showToast(result?.error || "Could not play wild card.");
+        }
       } else {
-        this.gameEngine.playCard({
+        const result = this.gameEngine.playCard({
           playerId,
           cardId,
           declaredColor: button.dataset.wildColor,
         });
+        if (!result.ok) {
+          this.showToast(result.error || "Could not play wild card.");
+        }
       }
     });
 
@@ -640,6 +704,8 @@ export class UIEngine {
     const state = this.stateManager.getState();
     const game = state.game;
     if (!game || !this.nodes.playersGrid) return;
+    const me = this.getLocalPlayer(game);
+    const isMyTurn = game.mode === "online" ? !!me && me.index === game.currentTurn : true;
 
     this.nodes.directionPill.textContent = `Direction: ${game.direction === 1 ? "Clockwise" : "Counterclockwise"}`;
     this.nodes.pileMeta.textContent = `Deck: ${game.drawPile.length}`;
@@ -649,10 +715,10 @@ export class UIEngine {
     this.nodes.discardCard.innerHTML = this.cardInner(top, true);
 
     const current = game.players[game.currentTurn];
-    this.nodes.drawCard.disabled = !!game.winnerId || current.isAI || !this.canLocalUserAct(current, game);
+    this.nodes.drawCard.disabled = !!game.winnerId || current.isAI || !isMyTurn;
 
     this.nodes.playersGrid.innerHTML = game.players
-      .map((player, index) => this.renderPlayerPanel(player, index, game))
+      .map((player, index) => this.renderPlayerPanel(player, index, game, { isMyTurn }))
       .join("");
 
     if (game.winnerId) {
@@ -665,16 +731,17 @@ export class UIEngine {
     this.updateOverlays();
   }
 
-  renderPlayerPanel(player, index, game) {
+  renderPlayerPanel(player, index, game, turnContext = {}) {
     const isActive = index === game.currentTurn;
     const localUserId = this.stateManager.getState().auth.user?.id;
+    const isMyTurn = turnContext.isMyTurn ?? false;
     const isLocalPlayer = game.mode === "online"
       ? !!localUserId && player.userId === localUserId
       : isActive;
     const canShowCards = isLocalPlayer && !player.isAI && !game.winnerId;
     const cards = canShowCards
       ? player.hand.map((card, cardIndex) => {
-          const playable = isActive && this.canLocalUserAct(player, game) && this.gameEngine.isPlayable(card, game);
+          const playable = isActive && isMyTurn && this.gameEngine.isPlayable(card, game);
           const mid = (player.hand.length - 1) / 2;
           const fanAngle = `${(cardIndex - mid) * 4}deg`;
           const fanLift = `${Math.abs(cardIndex - mid) * -1.2}px`;
@@ -880,11 +947,33 @@ export class UIEngine {
     `;
   }
 
-  canLocalUserAct(player, game) {
-    if (!player || !game) return false;
-    if (game.mode !== "online") return true;
+  getLocalPlayer(game) {
+    if (!game) return null;
+
+    if (game.mode !== "online") {
+      const index = game.currentTurn;
+      const player = game.players[index];
+      return player ? { player, index } : null;
+    }
+
     const localUserId = this.stateManager.getState().auth.user?.id;
-    return !!localUserId && localUserId === player.userId;
+    if (!localUserId) return null;
+
+    const index = game.players.findIndex((player) => player.userId === localUserId);
+    if (index === -1) return null;
+
+    return { player: game.players[index], index };
+  }
+
+  logOnlineTurnDebug(game, me) {
+    if (!game || game.mode !== "online") return;
+    const localUserId = this.stateManager.getState().auth.user?.id || null;
+    console.log("[ONLINE]", {
+      myIndex: me?.index ?? null,
+      currentTurn: game.currentTurn,
+      myUserId: localUserId,
+      currentUserIdInTurn: game.players[game.currentTurn]?.userId || null,
+    });
   }
 
   async leaveGameFlow() {
