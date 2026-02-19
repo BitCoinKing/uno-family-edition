@@ -53,6 +53,9 @@ export class OnlineEngine {
     this.localBroadcastRef = `ref_${Math.random().toString(36).slice(2, 10)}`;
     this.autoStartInFlight = false;
     this.pullRoomStateInFlight = false;
+    this.pullRoomStatePromise = null;
+    this.pullRoomStateQueued = false;
+    this.pullRoomStateQueuedRoomId = null;
     this.uiStatusTimer = null;
 
     this.eventBus.on("auth:changed", async () => {
@@ -67,7 +70,49 @@ export class OnlineEngine {
   }
 
   getRoomVersion() {
-    return this.activeRoom?.version ?? 0;
+    const activeVersion = Number(this.activeRoom?.version ?? 0);
+    return Math.max(activeVersion, this.getLastSeenVersion());
+  }
+
+  getLastSeenVersion() {
+    return Number(this.stateManager.getState().setup.online.lastSeenVersion || 0);
+  }
+
+  syncLastSeenVersion(version) {
+    const next = Number(version);
+    if (!Number.isFinite(next)) return;
+    const current = this.getLastSeenVersion();
+    if (next <= current) return;
+    this.patchSetup({ lastSeenVersion: next });
+  }
+
+  syncLocalSeatFromGame(game) {
+    if (!game || game.mode !== "online") {
+      this.patchSetup({ localPlayerId: null, localPlayerIndex: null });
+      return;
+    }
+
+    const localUserId = this.authManager.getUser()?.id;
+    if (!localUserId) {
+      this.patchSetup({ localPlayerId: null, localPlayerIndex: null });
+      return;
+    }
+
+    const localPlayerIndex = game.players.findIndex((player) => player.userId === localUserId);
+    const localPlayerId = localPlayerIndex >= 0 ? game.players[localPlayerIndex].id : null;
+
+    this.patchSetup({
+      localPlayerId,
+      localPlayerIndex: localPlayerIndex >= 0 ? localPlayerIndex : null,
+    });
+
+    console.log("[ONLINE][seat]", {
+      roomId: this.activeRoom?.id || this.stateManager.getState().setup.online.roomId || null,
+      version: this.getRoomVersion(),
+      localPlayerId,
+      localPlayerIndex: localPlayerIndex >= 0 ? localPlayerIndex : null,
+      currentTurn: game.currentTurn,
+    });
   }
 
   patchSetup(patch) {
@@ -252,6 +297,9 @@ export class OnlineEngine {
       status: room.status,
       expectedPlayers: room.expected_players,
       localDisplayName: safeName,
+      lastSeenVersion: room.version ?? 0,
+      localPlayerId: null,
+      localPlayerIndex: null,
     });
 
     try {
@@ -273,6 +321,7 @@ export class OnlineEngine {
       expectedPlayers: room.expected_players,
       localDisplayName: safeName,
       pendingInviteError: null,
+      lastSeenVersion: room.version ?? this.getLastSeenVersion(),
     });
 
     return { ok: true, roomCode: room.code };
@@ -319,6 +368,9 @@ export class OnlineEngine {
       status: room.status,
       expectedPlayers: room.expected_players,
       localDisplayName: safeName,
+      lastSeenVersion: room.version ?? 0,
+      localPlayerId: null,
+      localPlayerIndex: null,
     });
 
     const { data: players } = await this.supabase
@@ -371,6 +423,7 @@ export class OnlineEngine {
       expectedPlayers: room.expected_players,
       localDisplayName: safeName,
       pendingInviteError: null,
+      lastSeenVersion: room.version ?? this.getLastSeenVersion(),
     });
 
     if (snapshot?.room?.status !== "active") {
@@ -401,6 +454,9 @@ export class OnlineEngine {
 
     const expectedPlayers = room?.expected_players || online.expectedPlayers;
     this.syncSetupForExpectedPlayers(expectedPlayers);
+    if (Number.isFinite(Number(room?.version))) {
+      this.syncLastSeenVersion(Number(room.version));
+    }
 
     const user = this.authManager.getUser();
     if (this.activeRoom && room) {
@@ -412,6 +468,14 @@ export class OnlineEngine {
       roomCode: room?.code || online.roomCode,
       expectedPlayers,
       isHost: user?.id ? room?.host_user_id === user.id : false,
+    });
+
+    console.log("[ONLINE][lobby]", {
+      roomId: online.roomId,
+      status: room?.status || online.status,
+      version: room?.version ?? this.getRoomVersion(),
+      joined: (players || []).length,
+      expectedPlayers,
     });
 
     if (room?.status === "active") {
@@ -447,6 +511,9 @@ export class OnlineEngine {
 
     await this.teardownRoom();
     this.activeRoom = room;
+    this.activeRoom.version = room.version ?? this.activeRoom.version ?? 0;
+    this.syncLastSeenVersion(this.activeRoom.version);
+    console.log("[ONLINE][subscribe]", { roomId: room.id, version: this.activeRoom.version });
 
     const channelName = `uno-room-${room.id}`;
     this.channel = this.supabase.channel(channelName);
@@ -513,17 +580,52 @@ export class OnlineEngine {
     }
     this.channel = null;
     this.activeRoom = null;
+    this.patchSetup({
+      localPlayerId: null,
+      localPlayerIndex: null,
+      lastSeenVersion: 0,
+    });
   }
 
   async onRoomUpdated(room) {
-    if (this.activeRoom && this.activeRoom.id === room.id) {
-      this.activeRoom.version = room.version ?? this.activeRoom.version ?? 0;
+    const incomingVersion = Number(room.version);
+    const hasIncomingVersion = Number.isFinite(incomingVersion);
+    const lastSeenVersion = this.getLastSeenVersion();
+
+    if (hasIncomingVersion && incomingVersion < lastSeenVersion) {
+      console.log("[ONLINE][update:ignored]", {
+        roomId: room.id,
+        incomingVersion,
+        lastSeenVersion,
+      });
+      return;
     }
+
     this.patchSetup({ status: room.status, roomCode: room.code, expectedPlayers: room.expected_players });
     this.syncSetupForExpectedPlayers(room.expected_players);
 
+    console.log("[ONLINE][update]", {
+      roomId: room.id,
+      status: room.status,
+      incomingVersion: hasIncomingVersion ? incomingVersion : null,
+      lastSeenVersion,
+    });
+
+    if (hasIncomingVersion && incomingVersion > lastSeenVersion + 1) {
+      await this.pullRoomState(room.id);
+      return;
+    }
+
+    if (this.activeRoom && this.activeRoom.id === room.id && hasIncomingVersion) {
+      this.activeRoom.version = incomingVersion;
+    }
+    if (hasIncomingVersion) {
+      this.syncLastSeenVersion(incomingVersion);
+    }
+
     if (room.status === "active" && room.game_state) {
       this.gameEngine.applyRemoteGameState(room.game_state, "game:synced");
+      this.syncLocalSeatFromGame(room.game_state);
       return;
     }
 
@@ -550,6 +652,12 @@ export class OnlineEngine {
     const localUserId = this.authManager.getUser()?.id;
     if (!localUserId) return;
     if (body.actorUserId && body.actorUserId !== localUserId) return;
+    console.log("[ONLINE][intent_rejected]", {
+      roomId: this.activeRoom?.id || this.stateManager.getState().setup.online.roomId || null,
+      reason: body.reason || "invalid_move",
+      error: body.error || null,
+      expectedVersion: body.expectedVersion ?? null,
+    });
 
     if (body.reason === "stale_client") {
       const expectedVersion = Number(body.expectedVersion);
@@ -572,6 +680,10 @@ export class OnlineEngine {
       reason: body.reason || "invalid_move",
       error: body.error || "Move rejected.",
     });
+    const roomId = this.stateManager.getState().setup.online.roomId || this.activeRoom?.id;
+    if (roomId) {
+      this.pullRoomState(roomId);
+    }
   }
 
   async broadcastIntentRejected(actorUserId, payload = {}) {
@@ -593,7 +705,14 @@ export class OnlineEngine {
   async applyIntentAsHost(intent) {
     const state = this.stateManager.getState();
     const game = state.game;
-    if (!game) return;
+    if (!game) {
+      await this.broadcastIntentRejected(intent.actorUserId, {
+        ref: intent.ref || null,
+        reason: "invalid_move",
+        error: "Game not active.",
+      });
+      return { ok: false, error: "Game not active." };
+    }
 
     const hostRoomVersion = this.getRoomVersion();
     const clientRoomVersion = Number.isFinite(Number(intent.clientRoomVersion))
@@ -601,6 +720,11 @@ export class OnlineEngine {
       : -1;
 
     if (clientRoomVersion < hostRoomVersion) {
+      console.log("[ONLINE][intent:stale]", {
+        roomId: this.activeRoom?.id || null,
+        clientRoomVersion,
+        hostRoomVersion,
+      });
       await this.broadcastIntentRejected(intent.actorUserId, {
         ref: intent.ref || null,
         reason: "stale_client",
@@ -629,6 +753,11 @@ export class OnlineEngine {
     }
 
     if (!result.ok) {
+      console.log("[ONLINE][intent:invalid]", {
+        roomId: this.activeRoom?.id || null,
+        error: result.error || "Move rejected.",
+        type: intent.type,
+      });
       await this.broadcastIntentRejected(intent.actorUserId, {
         ref: intent.ref || null,
         reason: "invalid_move",
@@ -677,30 +806,57 @@ export class OnlineEngine {
     }
 
     this.activeRoom.version = data?.version ?? nextVersion;
+    this.syncLastSeenVersion(this.activeRoom.version);
     this.patchSetup({
       status: data?.status || status,
       roomCode: data?.code || this.stateManager.getState().setup.online.roomCode,
+    });
+    console.log("[ONLINE][push]", {
+      roomId: this.activeRoom.id,
+      version: this.activeRoom.version,
+      status: data?.status || status,
+      currentTurn: game.currentTurn,
     });
     return { ok: true, version: this.activeRoom.version };
   }
 
   async pullRoomState(roomIdOverride = null) {
-    if (this.pullRoomStateInFlight) return;
     const online = this.stateManager.getState().setup.online;
     const roomId = roomIdOverride || online.roomId;
     if (!this.supabase || !roomId) return;
 
+    if (this.pullRoomStatePromise) {
+      this.pullRoomStateQueued = true;
+      this.pullRoomStateQueuedRoomId = roomId;
+      return this.pullRoomStatePromise;
+    }
+
     this.pullRoomStateInFlight = true;
-    try {
+    this.pullRoomStatePromise = (async () => {
       const { data: room } = await this.supabase
         .from("game_rooms")
         .select("game_state, status, version, code")
         .eq("id", roomId)
         .single();
 
+      const pulledVersion = Number(room?.version);
+      const hasPulledVersion = Number.isFinite(pulledVersion);
+      const lastSeenVersion = this.getLastSeenVersion();
+      if (hasPulledVersion && pulledVersion < lastSeenVersion) {
+        console.log("[ONLINE][pull:ignored]", {
+          roomId,
+          pulledVersion,
+          lastSeenVersion,
+        });
+        return;
+      }
+
       if (room) {
-        if (this.activeRoom && this.activeRoom.id === roomId) {
-          this.activeRoom.version = room.version ?? this.activeRoom.version ?? 0;
+        if (this.activeRoom && this.activeRoom.id === roomId && hasPulledVersion) {
+          this.activeRoom.version = pulledVersion;
+        }
+        if (hasPulledVersion) {
+          this.syncLastSeenVersion(pulledVersion);
         }
         this.patchSetup({
           status: room.status || this.stateManager.getState().setup.online.status,
@@ -708,11 +864,30 @@ export class OnlineEngine {
         });
       }
 
+      console.log("[ONLINE][pull]", {
+        roomId,
+        version: hasPulledVersion ? pulledVersion : null,
+        status: room?.status || null,
+        hasGameState: !!room?.game_state,
+      });
+
       if (room?.game_state) {
         this.gameEngine.applyRemoteGameState(room.game_state, "game:synced");
+        this.syncLocalSeatFromGame(room.game_state);
       }
+    })();
+
+    try {
+      await this.pullRoomStatePromise;
     } finally {
+      this.pullRoomStatePromise = null;
       this.pullRoomStateInFlight = false;
+      if (this.pullRoomStateQueued) {
+        const queuedRoomId = this.pullRoomStateQueuedRoomId;
+        this.pullRoomStateQueued = false;
+        this.pullRoomStateQueuedRoomId = null;
+        await this.pullRoomState(queuedRoomId || roomId);
+      }
     }
   }
 
@@ -725,12 +900,18 @@ export class OnlineEngine {
     if (!online.isHost) return { ok: false, error: "Only the host can start the match." };
 
     if (!online.roomId) return { ok: false, error: "Join or create a room first." };
+    if (!online.roomCode) return { ok: false, error: "Room code missing." };
     const snapshot = await this.refreshLobby({ checkAutoStart: false });
     const lobbyPlayers = snapshot?.players || this.stateManager.getState().setup.online.lobbyPlayers;
     const expectedPlayers = snapshot?.expectedPlayers || online.expectedPlayers;
+    const roomStatus = snapshot?.room?.status || online.status;
 
     if (!lobbyPlayers || lobbyPlayers.length < 2) {
       return { ok: false, error: "Need at least 2 players in room." };
+    }
+
+    if (roomStatus !== "waiting") {
+      return { ok: false, error: "Match already started or finished." };
     }
 
     if (lobbyPlayers.length !== expectedPlayers) {
@@ -744,6 +925,7 @@ export class OnlineEngine {
     });
 
     if (!result.ok) return result;
+    this.syncLocalSeatFromGame(result.game);
     const pushed = await this.pushGameState();
     if (!pushed.ok) {
       return { ok: false, error: pushed.error || "Could not sync online match." };
@@ -780,16 +962,25 @@ export class OnlineEngine {
   async sendIntent(intent) {
     if (!this.channel) return { ok: false, error: "No active room channel." };
     const user = this.authManager.getUser();
+    const roomVersion = this.getRoomVersion();
 
     const payload = {
       ...intent,
       actorUserId: user?.id || null,
       clientRoomVersion: Number.isFinite(Number(intent.clientRoomVersion))
         ? Number(intent.clientRoomVersion)
-        : this.getRoomVersion(),
+        : roomVersion,
       ref: this.localBroadcastRef,
       at: Date.now(),
     };
+
+    console.log("[ONLINE][intent]", {
+      roomId: this.activeRoom?.id || this.stateManager.getState().setup.online.roomId || null,
+      type: payload.type,
+      actorUserId: payload.actorUserId,
+      clientRoomVersion: payload.clientRoomVersion,
+      hostRoomVersion: roomVersion,
+    });
 
     if (this.stateManager.getState().setup.online.isHost) {
       const result = await this.applyIntentAsHost(payload);
