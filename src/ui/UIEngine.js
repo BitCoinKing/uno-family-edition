@@ -553,17 +553,15 @@ export class UIEngine {
       if (!game || game.winnerId) return;
 
       if (game.mode === "online") {
-        const localPlayer = this.getLocalPlayer(game);
-        this.logOnlineTurnDebug(game, localPlayer);
-        if (!localPlayer) {
-          this.showToast("You are not seated in this room.");
+        const turn = await this.ensureOnlineTurn(game);
+        if (!turn.ok) {
+          this.showToast(turn.error || "Not your turn.");
           return;
         }
+        const localPlayer = turn.localPlayer;
+        const activeGame = turn.game;
+        this.logOnlineTurnDebug(activeGame, localPlayer);
         if (localPlayer.isAI) return;
-        if (!this.isLocalUsersTurn(game)) {
-          this.showToast("Not your turn.");
-          return;
-        }
 
         const result = await this.onlineEngine.requestDraw({
           playerId: localPlayer.id,
@@ -592,24 +590,23 @@ export class UIEngine {
 
       const cardId = cardNode.dataset.cardId;
       if (game.mode === "online") {
-        const localPlayer = this.getLocalPlayer(game);
-        this.logOnlineTurnDebug(game, localPlayer);
-        if (!localPlayer) {
-          this.showToast("You are not seated in this room.");
+        const turn = await this.ensureOnlineTurn(game);
+        if (!turn.ok) {
+          this.showToast(turn.error || "Not your turn.");
           return;
         }
+        const localPlayer = turn.localPlayer;
+        const activeGame = turn.game;
+        this.logOnlineTurnDebug(activeGame, localPlayer);
         if (localPlayer.isAI) return;
-        if (!this.isLocalUsersTurn(game)) {
-          this.showToast("Not your turn.");
-          return;
-        }
 
         const card = localPlayer.hand.find((item) => item.id === cardId);
         if (!card) {
-          this.showToast("Card not found in your hand.");
+          this.updateGame();
+          this.showToast("Hand updated. Tap your card again.");
           return;
         }
-        if (!this.gameEngine.isPlayable(card, game)) {
+        if (!this.gameEngine.isPlayable(card, activeGame)) {
           this.showToast("That card cannot be played now.");
           return;
         }
@@ -987,6 +984,39 @@ export class UIEngine {
     const localPlayer = this.getLocalPlayer(game);
     if (!localPlayer) return false;
     return game.players[game.currentTurn]?.id === localPlayer.id;
+  }
+
+  async ensureOnlineTurn(game) {
+    if (!game || game.mode !== "online") {
+      return { ok: false, error: "Game is not in online mode." };
+    }
+
+    let localPlayer = this.getLocalPlayer(game);
+    if (!localPlayer) {
+      return { ok: false, error: "You are not seated in this room." };
+    }
+
+    if (this.isLocalUsersTurn(game)) {
+      return { ok: true, game, localPlayer };
+    }
+
+    await this.onlineEngine.pullRoomState();
+
+    const refreshedGame = this.stateManager.getState().game;
+    if (!refreshedGame || refreshedGame.mode !== "online") {
+      return { ok: false, error: "Game is syncing. Try again." };
+    }
+
+    localPlayer = this.getLocalPlayer(refreshedGame);
+    if (!localPlayer) {
+      return { ok: false, error: "You are not seated in this room." };
+    }
+
+    if (!this.isLocalUsersTurn(refreshedGame)) {
+      return { ok: false, error: "Not your turn." };
+    }
+
+    return { ok: true, game: refreshedGame, localPlayer };
   }
 
   canLocalUserAct(player, game) {
