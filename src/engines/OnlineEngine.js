@@ -52,6 +52,8 @@ export class OnlineEngine {
     this.activeRoom = null;
     this.localBroadcastRef = `ref_${Math.random().toString(36).slice(2, 10)}`;
     this.autoStartInFlight = false;
+    this.pullRoomStateInFlight = false;
+    this.activeStatePullTimer = null;
 
     this.eventBus.on("auth:changed", async () => {
       await this.refreshLobby();
@@ -208,7 +210,21 @@ export class OnlineEngine {
       return { ok: false, error: playerError.message };
     }
 
-    await this.subscribeToRoom(room);
+    this.patchSetup({
+      roomCode: room.code,
+      roomId: room.id,
+      isHost: true,
+      status: room.status,
+      expectedPlayers: room.expected_players,
+      localDisplayName: safeName,
+    });
+
+    try {
+      await this.subscribeToRoom(room);
+    } catch (error) {
+      this.patchSetup({ loading: false, error: "Could not subscribe to room updates." });
+      return { ok: false, error: "Could not subscribe to room updates." };
+    }
     this.syncSetupForExpectedPlayers(room.expected_players);
     await this.refreshLobby();
 
@@ -261,6 +277,14 @@ export class OnlineEngine {
       selectedPlayers: room.expected_players,
       playerNames: Array.from({ length: room.expected_players }, (_, i) => setup.playerNames[i] || ""),
     });
+    this.patchSetup({
+      roomCode: room.code,
+      roomId: room.id,
+      isHost: room.host_user_id === user.id,
+      status: room.status,
+      expectedPlayers: room.expected_players,
+      localDisplayName: safeName,
+    });
 
     const { data: players } = await this.supabase
       .from("room_players")
@@ -294,8 +318,13 @@ export class OnlineEngine {
       }
     }
 
-    await this.subscribeToRoom(room);
-    await this.refreshLobby();
+    try {
+      await this.subscribeToRoom(room);
+    } catch (error) {
+      this.patchSetup({ loading: false, error: "Could not subscribe to room updates." });
+      return { ok: false, error: "Could not subscribe to room updates." };
+    }
+    const snapshot = await this.refreshLobby();
 
     this.patchSetup({
       loading: false,
@@ -309,8 +338,8 @@ export class OnlineEngine {
       pendingInviteError: null,
     });
 
-    if (room.status === "active") {
-      await this.pullRoomState();
+    if (snapshot?.room?.status === "active") {
+      await this.pullRoomState(room.id);
     }
 
     return { ok: true };
@@ -344,6 +373,19 @@ export class OnlineEngine {
       expectedPlayers,
       isHost: user?.id ? room?.host_user_id === user.id : false,
     });
+
+    if (room?.status === "active") {
+      const currentState = this.stateManager.getState();
+      const currentGame = currentState.game;
+      const alreadyInGame = currentState.screen === "game"
+        && !!currentGame
+        && currentGame.mode === "online"
+        && (currentGame.roomCode === (room.code || online.roomCode));
+
+      if (!alreadyInGame) {
+        await this.pullRoomState(online.roomId);
+      }
+    }
 
     if (checkAutoStart) {
       await this.maybeAutoStart({
@@ -390,12 +432,43 @@ export class OnlineEngine {
         });
       })
       .on("broadcast", { event: "move_intent" }, (payload) => this.onMoveIntent(payload))
-      .subscribe();
+      ;
+
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        fn(value);
+      };
+
+      const timeoutId = setTimeout(() => {
+        finish(reject, new Error("Room subscription timed out."));
+      }, 10000);
+
+      this.channel.subscribe((status, err) => {
+        if (status === "SUBSCRIBED") {
+          clearTimeout(timeoutId);
+          finish(resolve);
+          return;
+        }
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          clearTimeout(timeoutId);
+          finish(reject, new Error(err?.message || "Room subscription error."));
+        }
+      });
+    });
+
+    await this.pullRoomState(room.id);
   }
 
   async teardownRoom() {
     if (this.channel && this.supabase) {
       await this.supabase.removeChannel(this.channel);
+    }
+    if (this.activeStatePullTimer) {
+      clearTimeout(this.activeStatePullTimer);
+      this.activeStatePullTimer = null;
     }
     this.channel = null;
     this.activeRoom = null;
@@ -409,7 +482,22 @@ export class OnlineEngine {
     this.syncSetupForExpectedPlayers(room.expected_players);
     if (room.game_state) {
       this.gameEngine.applyRemoteGameState(room.game_state, "game:synced");
+      return;
     }
+
+    if (room.status === "active") {
+      this.scheduleActiveStatePull();
+    }
+  }
+
+  scheduleActiveStatePull() {
+    if (this.activeStatePullTimer) return;
+    this.activeStatePullTimer = setTimeout(async () => {
+      this.activeStatePullTimer = null;
+      const roomId = this.stateManager.getState().setup.online.roomId || this.activeRoom?.id;
+      if (!roomId) return;
+      await this.pullRoomState(roomId);
+    }, 150);
   }
 
   async onMoveIntent(payload) {
@@ -472,18 +560,25 @@ export class OnlineEngine {
     this.activeRoom.version = (this.activeRoom.version || 0) + 1;
   }
 
-  async pullRoomState() {
+  async pullRoomState(roomIdOverride = null) {
+    if (this.pullRoomStateInFlight) return;
     const online = this.stateManager.getState().setup.online;
-    if (!this.supabase || !online.roomId) return;
+    const roomId = roomIdOverride || online.roomId;
+    if (!this.supabase || !roomId) return;
 
-    const { data: room } = await this.supabase
-      .from("game_rooms")
-      .select("game_state, status")
-      .eq("id", online.roomId)
-      .single();
+    this.pullRoomStateInFlight = true;
+    try {
+      const { data: room } = await this.supabase
+        .from("game_rooms")
+        .select("game_state, status")
+        .eq("id", roomId)
+        .single();
 
-    if (room?.game_state) {
-      this.gameEngine.applyRemoteGameState(room.game_state, "game:synced");
+      if (room?.game_state) {
+        this.gameEngine.applyRemoteGameState(room.game_state, "game:synced");
+      }
+    } finally {
+      this.pullRoomStateInFlight = false;
     }
   }
 
