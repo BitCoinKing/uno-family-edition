@@ -1,0 +1,10 @@
+{
+  "name": "uno-family-edition",
+  "private": true,
+  "type": "module",
+  "version": "1.1.0",
+  "scripts": {
+    "dev": "vercel dev",
+    "serve": "python3 -m http.server 4173"
+  }
+}
