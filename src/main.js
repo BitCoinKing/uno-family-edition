@@ -20,9 +20,9 @@ const eventBus = new EventBus();
 const initialState = {
   screen: "landing",
   setup: {
-    selectedPlayers: 3,
+    selectedPlayers: 2,
     mode: "local",
-    playerNames: ["DAD", "LILY", "LIA"],
+    playerNames: ["", ""],
     online: {
       enabled: false,
       loading: false,
@@ -30,7 +30,7 @@ const initialState = {
       roomCode: "",
       inviteToken: "",
       inviteUrl: "",
-      expectedPlayers: 3,
+      expectedPlayers: 2,
       isHost: false,
       status: "offline",
       lobbyPlayers: [],

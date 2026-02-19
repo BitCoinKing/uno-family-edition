@@ -51,6 +51,7 @@ export class OnlineEngine {
     this.channel = null;
     this.activeRoom = null;
     this.localBroadcastRef = `ref_${Math.random().toString(36).slice(2, 10)}`;
+    this.autoStartInFlight = false;
 
     this.eventBus.on("auth:changed", async () => {
       await this.refreshLobby();
@@ -80,6 +81,24 @@ export class OnlineEngine {
     this.gameEngine.updateSetup({
       online: merged,
     });
+  }
+
+  syncSetupForExpectedPlayers(expectedPlayers) {
+    const setup = this.stateManager.getState().setup;
+    const n = Number(expectedPlayers);
+    const safeExpected = Number.isFinite(n)
+      ? Math.max(2, Math.min(5, n))
+      : Math.max(2, Math.min(5, setup.selectedPlayers));
+
+    const nextNames = Array.from({ length: safeExpected }, (_, i) => setup.playerNames[i] || "");
+    const shouldUpdate = setup.selectedPlayers !== safeExpected || setup.playerNames.length !== safeExpected;
+
+    if (shouldUpdate) {
+      this.gameEngine.updateSetup({
+        selectedPlayers: safeExpected,
+        playerNames: nextNames,
+      });
+    }
   }
 
   hydrateInviteFromUrl() {
@@ -190,6 +209,7 @@ export class OnlineEngine {
     }
 
     await this.subscribeToRoom(room);
+    this.syncSetupForExpectedPlayers(room.expected_players);
     await this.refreshLobby();
 
     this.patchSetup({
@@ -233,6 +253,14 @@ export class OnlineEngine {
       this.patchSetup({ loading: false, error: "Room has already finished." });
       return { ok: false, error: "Room finished." };
     }
+
+    this.syncSetupForExpectedPlayers(room.expected_players);
+    const setup = this.stateManager.getState().setup;
+    this.gameEngine.updateSetup({
+      mode: "online",
+      selectedPlayers: room.expected_players,
+      playerNames: Array.from({ length: room.expected_players }, (_, i) => setup.playerNames[i] || ""),
+    });
 
     const { data: players } = await this.supabase
       .from("room_players")
@@ -288,7 +316,8 @@ export class OnlineEngine {
     return { ok: true };
   }
 
-  async refreshLobby() {
+  async refreshLobby(options = {}) {
+    const { checkAutoStart = true } = options;
     const { online } = this.stateManager.getState().setup;
     if (!this.supabase || !online.roomId) return;
 
@@ -304,14 +333,31 @@ export class OnlineEngine {
       .eq("id", online.roomId)
       .single();
 
+    const expectedPlayers = room?.expected_players || online.expectedPlayers;
+    this.syncSetupForExpectedPlayers(expectedPlayers);
+
     const user = this.authManager.getUser();
     this.patchSetup({
       lobbyPlayers: players || [],
       status: room?.status || online.status,
       roomCode: room?.code || online.roomCode,
-      expectedPlayers: room?.expected_players || online.expectedPlayers,
+      expectedPlayers,
       isHost: user?.id ? room?.host_user_id === user.id : false,
     });
+
+    if (checkAutoStart) {
+      await this.maybeAutoStart({
+        room: room || null,
+        players: players || [],
+        expectedPlayers,
+      });
+    }
+
+    return {
+      room: room || null,
+      players: players || [],
+      expectedPlayers,
+    };
   }
 
   async subscribeToRoom(room) {
@@ -336,7 +382,12 @@ export class OnlineEngine {
         table: "room_players",
         filter: `room_id=eq.${room.id}`,
       }, async () => {
-        await this.refreshLobby();
+        const snapshot = await this.refreshLobby({ checkAutoStart: false });
+        await this.maybeAutoStart({
+          room: snapshot?.room || null,
+          players: snapshot?.players || [],
+          expectedPlayers: snapshot?.expectedPlayers || null,
+        });
       })
       .on("broadcast", { event: "move_intent" }, (payload) => this.onMoveIntent(payload))
       .subscribe();
@@ -355,6 +406,7 @@ export class OnlineEngine {
       this.activeRoom.version = room.version || this.activeRoom.version || 0;
     }
     this.patchSetup({ status: room.status, roomCode: room.code, expectedPlayers: room.expected_players });
+    this.syncSetupForExpectedPlayers(room.expected_players);
     if (room.game_state) {
       this.gameEngine.applyRemoteGameState(room.game_state, "game:synced");
     }
@@ -443,15 +495,17 @@ export class OnlineEngine {
     if (!this.supabase || !user) return { ok: false, error: "You must sign in first." };
     if (!online.isHost) return { ok: false, error: "Only the host can start the match." };
 
-    await this.refreshLobby();
-    const lobbyPlayers = this.stateManager.getState().setup.online.lobbyPlayers;
+    if (!online.roomId) return { ok: false, error: "Join or create a room first." };
+    const snapshot = await this.refreshLobby({ checkAutoStart: false });
+    const lobbyPlayers = snapshot?.players || this.stateManager.getState().setup.online.lobbyPlayers;
+    const expectedPlayers = snapshot?.expectedPlayers || online.expectedPlayers;
 
     if (!lobbyPlayers || lobbyPlayers.length < 2) {
       return { ok: false, error: "Need at least 2 players in room." };
     }
 
-    if (lobbyPlayers.length !== online.expectedPlayers) {
-      return { ok: false, error: `Waiting for all players (${lobbyPlayers.length}/${online.expectedPlayers}).` };
+    if (lobbyPlayers.length !== expectedPlayers) {
+      return { ok: false, error: `Waiting for all players (${lobbyPlayers.length}/${expectedPlayers}).` };
     }
 
     const result = this.gameEngine.startOnlineGame({
@@ -463,6 +517,32 @@ export class OnlineEngine {
     if (!result.ok) return result;
     await this.pushGameState();
     return { ok: true };
+  }
+
+  async maybeAutoStart({ room, players, expectedPlayers }) {
+    if (this.autoStartInFlight) return;
+
+    const state = this.stateManager.getState();
+    const online = state.setup.online;
+    const user = this.authManager.getUser();
+    const expected = expectedPlayers || online.expectedPlayers;
+    const lobbyPlayers = players || online.lobbyPlayers || [];
+    const roomStatus = room?.status || online.status;
+    const hostUserId = room?.host_user_id || null;
+
+    if (!user || !online.roomId) return;
+    if (!online.isHost) return;
+    if (hostUserId && hostUserId !== user.id) return;
+    if (roomStatus !== "waiting") return;
+    if (!expected || expected < 2) return;
+    if (lobbyPlayers.length !== expected) return;
+
+    this.autoStartInFlight = true;
+    try {
+      await this.startOnlineMatch();
+    } finally {
+      this.autoStartInFlight = false;
+    }
   }
 
   async sendIntent(intent) {

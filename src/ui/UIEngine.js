@@ -113,12 +113,13 @@ export class UIEngine {
         <div class="panel setup-panel">
           <h2>Game Setup</h2>
           <div class="setup-grid">
-            <label>
+            <label id="player-count-label">
               Players
               <select id="player-count" class="input">
                 ${[1, 2, 3, 4, 5].map((n) => `<option value="${n}" ${setup.selectedPlayers === n ? "selected" : ""}>${n}</option>`).join("")}
               </select>
             </label>
+            <p id="player-count-locked" class="small-text hidden"></p>
 
             <div class="mode-toggle">
               <button id="mode-local" class="btn ${setup.mode === "local" ? "active" : ""}">Local Multiplayer</button>
@@ -178,6 +179,8 @@ export class UIEngine {
 
   cacheSetupNodes() {
     this.nodes.playerCount = this.root.querySelector("#player-count");
+    this.nodes.playerCountLabel = this.root.querySelector("#player-count-label");
+    this.nodes.playerCountLocked = this.root.querySelector("#player-count-locked");
     this.nodes.nameFields = this.root.querySelector("#player-name-fields");
     this.nodes.onlinePanel = this.root.querySelector("#online-panel");
     this.nodes.note = this.root.querySelector("#setup-note");
@@ -211,6 +214,7 @@ export class UIEngine {
     });
 
     this.nodes.playerCount?.addEventListener("change", (e) => {
+      if (this.nodes.playerCount?.disabled) return;
       const selectedPlayers = Number(e.target.value);
       const oldNames = this.stateManager.getState().setup.playerNames;
       const playerNames = Array.from({ length: selectedPlayers }, (_, i) => oldNames[i] || "");
@@ -340,19 +344,31 @@ export class UIEngine {
   updateSetupFields() {
     if (!this.nodes.nameFields) return;
     const setup = this.stateManager.getState().setup;
+    const online = setup.online;
+    const onlineLocked = setup.mode === "online"
+      && !!(online.roomId || online.roomCode || online.pendingInviteCode);
+    const lockedPlayers = online.expectedPlayers || setup.selectedPlayers;
+    const joinedCount = online.lobbyPlayers?.length || 0;
+    const remaining = Math.max(lockedPlayers - joinedCount, 0);
 
     this.nodes.playerCount.value = String(setup.selectedPlayers);
+    this.nodes.playerCount.disabled = onlineLocked;
+    this.nodes.playerCountLabel.classList.toggle("hidden", onlineLocked);
+    this.nodes.playerCountLocked.classList.toggle("hidden", !onlineLocked);
+    if (onlineLocked) {
+      this.nodes.playerCountLocked.textContent = `Players (locked): ${lockedPlayers}`;
+    }
     this.nodes.note.textContent = setup.selectedPlayers === 1
       ? "Solo mode detected: one AI opponent will be added automatically."
       : setup.mode === "online"
-        ? "Online mode: sign in with Google, create or join a room, then start when lobby is full."
+        ? "Online mode: host picks player count, invite friends, and the match auto-starts when lobby is full."
         : "Local pass-and-play enabled.";
 
     if (this.lastSetupCount !== setup.selectedPlayers) {
       this.nodes.nameFields.innerHTML = setup.playerNames.map((name, idx) => `
         <label class="name-field">
           Player ${idx + 1} Name
-          <input data-name-index="${idx}" value="${name}" class="input" maxlength="16" placeholder="Enter name" />
+          <input data-name-index="${idx}" value="${name}" class="input" maxlength="16" placeholder="Enter Player ${idx + 1} Name" />
         </label>
       `).join("");
 
@@ -380,9 +396,25 @@ export class UIEngine {
 
     const startBtn = this.root.querySelector("#start-match");
     if (setup.mode === "online") {
-      const online = setup.online;
-      startBtn.textContent = "Start Online Match";
-      startBtn.disabled = !online.isHost || !online.roomCode;
+      if (!online.roomId) {
+        startBtn.textContent = "Create or Join Room";
+        startBtn.disabled = true;
+      } else if (online.status === "active") {
+        startBtn.textContent = "Match In Progress";
+        startBtn.disabled = true;
+      } else if (online.status === "waiting" && online.isHost && remaining === 0) {
+        startBtn.textContent = "Starting game...";
+        startBtn.disabled = true;
+      } else if (online.status === "waiting" && online.isHost) {
+        startBtn.textContent = `Waiting for players (${joinedCount}/${lockedPlayers})`;
+        startBtn.disabled = true;
+      } else if (online.status === "waiting") {
+        startBtn.textContent = `Waiting for host (${joinedCount}/${lockedPlayers})`;
+        startBtn.disabled = true;
+      } else {
+        startBtn.textContent = "Start Online Match";
+        startBtn.disabled = true;
+      }
     } else {
       startBtn.textContent = "Start Match";
       startBtn.disabled = false;
@@ -422,11 +454,30 @@ export class UIEngine {
           </div>
         `
       : "";
+    const expectedPlayers = online.expectedPlayers || setup.selectedPlayers;
+    const joinedCount = lobbyPlayers.length;
+    const waitingFor = Math.max(expectedPlayers - joinedCount, 0);
+    const waitingCopy = online.status === "active"
+      ? "Match started."
+      : waitingFor === 0
+        ? (online.isHost ? "Starting game..." : "Waiting for host to start...")
+        : `Waiting for ${waitingFor} more player${waitingFor === 1 ? "" : "s"}...`;
+    const roomControls = online.roomId
+      ? `<p class="small-text">Connected to room. Share invite link or wait in lobby.</p>`
+      : `
+          <div class="online-controls">
+            <button class="btn" data-online-action="create-room" ${!auth.user ? "disabled" : ""}>Create Room</button>
+            <input id="room-code-input" class="input room-code-input" placeholder="Room code" value="${online.pendingInviteCode || online.roomCode || ""}" ${!auth.user ? "disabled" : ""} />
+            <button class="btn" data-online-action="join-room" ${!auth.user ? "disabled" : ""}>Join Room</button>
+          </div>
+        `;
 
     this.nodes.onlinePanel.innerHTML = `
       <div class="online-card">
         <h3>Online Lobby</h3>
         <p class="small-text">Status: ${online.status || "offline"} ${online.loading ? "(loading...)" : ""}</p>
+        <p class="small-text">Players Joined: ${joinedCount} / ${expectedPlayers}</p>
+        <p class="small-text">${waitingCopy}</p>
         ${pendingInviteNotice}
         ${pendingInviteError}
         ${
@@ -440,18 +491,13 @@ export class UIEngine {
                    <button class='btn ghost' data-online-action='auth-apple'>Sign in with Apple</button>
                  </div>`
         }
-
-        <div class="online-controls">
-          <button class="btn" data-online-action="create-room" ${!auth.user ? "disabled" : ""}>Create Room</button>
-          <input id="room-code-input" class="input room-code-input" placeholder="Room code" value="${online.roomCode || ""}" ${!auth.user ? "disabled" : ""} />
-          <button class="btn" data-online-action="join-room" ${!auth.user ? "disabled" : ""}>Join Room</button>
-        </div>
+        ${roomControls}
 
         <div class="online-room-meta">
           <p class="small-text">Room: <strong>${online.roomCode || "-"}</strong></p>
           <button class="btn ghost" data-online-action="copy-room" ${!online.roomCode ? "disabled" : ""}>Copy Code</button>
           <p class="small-text">Host: ${online.isHost ? "You" : "Another player"}</p>
-          <p class="small-text">Players: ${lobbyPlayers.length}/${online.expectedPlayers || setup.selectedPlayers}</p>
+          <p class="small-text">Players: ${joinedCount}/${expectedPlayers}</p>
         </div>
         ${inviteSection}
 
