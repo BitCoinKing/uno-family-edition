@@ -181,6 +181,38 @@ body::after {
   align-items: center;
 }
 
+.invite-box {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 12px;
+  padding: 0.55rem;
+  background: rgba(255, 255, 255, 0.04);
+  display: grid;
+  gap: 0.45rem;
+}
+
+.invite-box code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.82rem;
+}
+
+.invite-url-input {
+  font-size: 0.86rem;
+}
+
+.invite-actions {
+  display: flex;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.invite-notice {
+  color: #ffe89a;
+}
+
+.invite-error {
+  color: #ffb2b2;
+}
+
 .lobby-list {
   margin: 0;
   padding-left: 1.1rem;

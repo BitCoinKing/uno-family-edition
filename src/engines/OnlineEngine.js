@@ -8,6 +8,38 @@ function randomRoomCode(length = 6) {
   return code;
 }
 
+function encodeInviteToken(roomCode) {
+  try {
+    return btoa(roomCode)
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/g, "");
+  } catch {
+    return "";
+  }
+}
+
+function decodeInviteToken(token) {
+  try {
+    const normalized = token.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const decoded = atob(padded);
+    return decoded.trim().toUpperCase();
+  } catch {
+    return "";
+  }
+}
+
+function displayNameFromUser(user) {
+  const meta = user?.user_metadata || {};
+  return (
+    meta.full_name ||
+    meta.name ||
+    (user?.email ? user.email.split("@")[0] : "") ||
+    "Player"
+  );
+}
+
 export class OnlineEngine {
   constructor({ eventBus, stateManager, gameEngine, authManager }) {
     this.eventBus = eventBus;
@@ -22,6 +54,7 @@ export class OnlineEngine {
 
     this.eventBus.on("auth:changed", async () => {
       await this.refreshLobby();
+      await this.tryAutoJoinFromInvite();
     });
   }
 
@@ -31,19 +64,87 @@ export class OnlineEngine {
   }
 
   patchSetup(patch) {
+    const current = this.stateManager.getState().setup.online;
+    const merged = { ...current, ...patch };
+
+    if (merged.roomCode) {
+      const token = encodeInviteToken(merged.roomCode);
+      const inviteUrl = `${window.location.origin}?invite=${encodeURIComponent(token)}`;
+      merged.inviteToken = token;
+      merged.inviteUrl = inviteUrl;
+    } else {
+      merged.inviteToken = "";
+      merged.inviteUrl = "";
+    }
+
     this.gameEngine.updateSetup({
+      online: merged,
+    });
+  }
+
+  hydrateInviteFromUrl() {
+    const url = new URL(window.location.href);
+    const inviteToken = (url.searchParams.get("invite") || "").trim();
+    const inviteCodeRaw = (url.searchParams.get("room") || "").trim().toUpperCase();
+    const inviteCode = inviteCodeRaw || decodeInviteToken(inviteToken);
+
+    if (!inviteCode) return;
+
+    const state = this.stateManager.getState();
+    const setup = state.setup;
+    const nextPlayers = Math.max(2, setup.selectedPlayers);
+
+    this.gameEngine.updateSetup({
+      mode: "online",
+      selectedPlayers: nextPlayers,
+      playerNames: Array.from({ length: nextPlayers }, (_, i) => setup.playerNames[i] || ""),
       online: {
-        ...this.stateManager.getState().setup.online,
-        ...patch,
+        ...setup.online,
+        pendingInviteCode: inviteCode,
+        pendingInviteToken: inviteToken || encodeInviteToken(inviteCode),
       },
     });
+    this.gameEngine.setScreen("setup");
+  }
+
+  async tryAutoJoinFromInvite() {
+    const state = this.stateManager.getState();
+    const online = state.setup.online;
+    const user = this.authManager.getUser();
+
+    if (!this.supabase || !user) return;
+    if (!online.pendingInviteCode) return;
+    if (online.roomId || online.loading) return;
+
+    const preferred = (online.localDisplayName || displayNameFromUser(user)).trim();
+    if (!preferred) return;
+
+    this.patchSetup({ localDisplayName: preferred });
+    const code = online.pendingInviteCode;
+    const result = await this.joinRoom({ roomCode: code, displayName: preferred });
+
+    if (result.ok) {
+      this.patchSetup({ pendingInviteCode: "", pendingInviteToken: "" });
+      this.clearInviteParamsFromLocation();
+      this.eventBus.emit("online:autojoined", { roomCode: code });
+    } else {
+      this.patchSetup({ pendingInviteError: result.error || "Invite join failed." });
+      this.eventBus.emit("online:autojoin-failed", { error: result.error || "Invite join failed." });
+    }
+  }
+
+  clearInviteParamsFromLocation() {
+    const url = new URL(window.location.href);
+    url.searchParams.delete("invite");
+    url.searchParams.delete("room");
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
   }
 
   async createRoom({ displayName, expectedPlayers }) {
     const user = this.authManager.getUser();
     if (!this.supabase || !user) return { ok: false, error: "Sign in first." };
 
-    const safeName = (displayName || "").trim();
+    const safeName = ((displayName || "").trim() || displayNameFromUser(user)).trim();
     if (!safeName) return { ok: false, error: "Enter your name before creating a room." };
 
     this.patchSetup({ loading: true, error: null });
@@ -100,6 +201,7 @@ export class OnlineEngine {
       status: room.status,
       expectedPlayers: room.expected_players,
       localDisplayName: safeName,
+      pendingInviteError: null,
     });
 
     return { ok: true, roomCode: room.code };
@@ -110,7 +212,7 @@ export class OnlineEngine {
     if (!this.supabase || !user) return { ok: false, error: "Sign in first." };
 
     const code = (roomCode || "").trim().toUpperCase();
-    const safeName = (displayName || "").trim();
+    const safeName = ((displayName || "").trim() || displayNameFromUser(user)).trim();
     if (!code) return { ok: false, error: "Enter a room code." };
     if (!safeName) return { ok: false, error: "Enter your name first." };
 
@@ -176,6 +278,7 @@ export class OnlineEngine {
       status: room.status,
       expectedPlayers: room.expected_players,
       localDisplayName: safeName,
+      pendingInviteError: null,
     });
 
     if (room.status === "active") {

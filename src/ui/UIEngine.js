@@ -54,6 +54,12 @@ export class UIEngine {
     this.eventBus.on("game:left", () => this.renderScreen());
     this.eventBus.on("stats:updated", () => this.updateScoreboardTable());
     this.eventBus.on("auth:state", () => this.updateSetupOnlinePanel());
+    this.eventBus.on("online:autojoined", (payload) => {
+      this.showToast(`Joined room ${payload.roomCode} from invite link.`);
+    });
+    this.eventBus.on("online:autojoin-failed", (payload) => {
+      if (this.nodes.error) this.nodes.error.textContent = payload.error;
+    });
 
     this.eventBus.on("game:feedback", (payload) => this.handleFeedback(payload));
     this.eventBus.on("game:turn", (payload) => this.handleTurn(payload));
@@ -275,6 +281,34 @@ export class UIEngine {
         if (!online.roomCode) return;
         await navigator.clipboard.writeText(online.roomCode);
         this.showToast(`Copied room code: ${online.roomCode}`);
+        return;
+      }
+
+      if (action === "copy-invite-link") {
+        if (!online.inviteUrl) return;
+        await navigator.clipboard.writeText(online.inviteUrl);
+        this.showToast("Invite link copied.");
+        return;
+      }
+
+      if (action === "share-invite-link") {
+        if (!online.inviteUrl) return;
+        try {
+          if (navigator.share) {
+            await navigator.share({
+              title: "Join my UNO room",
+              text: "Tap to join my UNO room.",
+              url: online.inviteUrl,
+            });
+          } else {
+            await navigator.clipboard.writeText(online.inviteUrl);
+            this.showToast("Invite link copied.");
+          }
+        } catch (err) {
+          if (err?.name !== "AbortError") {
+            this.showToast("Could not open share sheet.");
+          }
+        }
       }
     });
 
@@ -370,11 +404,31 @@ export class UIEngine {
     const lobbyRows = lobbyPlayers.length
       ? lobbyPlayers.map((p) => `<li><span>${p.player_index + 1}.</span> ${p.display_name}</li>`).join("")
       : "<li>No players joined yet.</li>";
+    const pendingInviteNotice = online.pendingInviteCode
+      ? `<p class="small-text invite-notice">Invite detected for room <strong>${online.pendingInviteCode}</strong>. Sign in to auto-join.</p>`
+      : "";
+    const pendingInviteError = online.pendingInviteError
+      ? `<p class="small-text invite-error">${online.pendingInviteError}</p>`
+      : "";
+    const inviteSection = online.roomCode
+      ? `
+          <div class="invite-box">
+            <p class="small-text">Invite Token: <code>${online.inviteToken}</code></p>
+            <input class="input invite-url-input" value="${online.inviteUrl}" readonly />
+            <div class="invite-actions">
+              <button class="btn ghost" data-online-action="copy-invite-link">Copy Invite Link</button>
+              <button class="btn ghost" data-online-action="share-invite-link">Share Invite Link</button>
+            </div>
+          </div>
+        `
+      : "";
 
     this.nodes.onlinePanel.innerHTML = `
       <div class="online-card">
         <h3>Online Lobby</h3>
         <p class="small-text">Status: ${online.status || "offline"} ${online.loading ? "(loading...)" : ""}</p>
+        ${pendingInviteNotice}
+        ${pendingInviteError}
         ${
           !auth.enabled
             ? "<p class='small-text'>Supabase keys missing. Set Vercel env vars first.</p>"
@@ -399,6 +453,7 @@ export class UIEngine {
           <p class="small-text">Host: ${online.isHost ? "You" : "Another player"}</p>
           <p class="small-text">Players: ${lobbyPlayers.length}/${online.expectedPlayers || setup.selectedPlayers}</p>
         </div>
+        ${inviteSection}
 
         <ul class="lobby-list">${lobbyRows}</ul>
       </div>
@@ -496,7 +551,7 @@ export class UIEngine {
       }
     });
 
-    this.nodes.settingsModal?.addEventListener("click", (event) => {
+    this.nodes.settingsModal?.addEventListener("click", async (event) => {
       if (event.target.matches(".modal-close") || event.target.classList.contains("modal")) {
         this.gameEngine.openSettings(false);
         return;
@@ -511,6 +566,14 @@ export class UIEngine {
 
       if (event.target.matches("#leave-from-settings")) {
         this.leaveGameFlow();
+        return;
+      }
+
+      if (event.target.matches("#signout-from-settings")) {
+        await this.authManager.signOut();
+        await this.leaveGameFlow();
+        this.gameEngine.setScreen("setup");
+        this.showToast("Signed out.");
       }
     });
   }
@@ -699,6 +762,7 @@ export class UIEngine {
     }
 
     if (state.ui.settingsOpen) {
+      const signedIn = !!state.auth.user;
       this.nodes.settingsModal.classList.remove("hidden");
       this.nodes.settingsModal.innerHTML = `
         <div class="modal-card">
@@ -707,6 +771,7 @@ export class UIEngine {
           <button id="sound-toggle" class="btn" data-enabled="${this.soundManager.enabled}">
             ${this.soundManager.enabled ? "Sound: On" : "Sound: Off"}
           </button>
+          ${signedIn ? "<button id=\"signout-from-settings\" class=\"btn ghost\">Log Out</button>" : ""}
           <button id="leave-from-settings" class="btn danger">Leave Game</button>
         </div>
       `;
@@ -775,6 +840,8 @@ export class UIEngine {
           lobbyPlayers: [],
           roomId: null,
           roomCode: "",
+          inviteToken: "",
+          inviteUrl: "",
           isHost: false,
         },
       });

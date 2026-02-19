@@ -28,11 +28,16 @@ const initialState = {
       loading: false,
       roomId: null,
       roomCode: "",
+      inviteToken: "",
+      inviteUrl: "",
       expectedPlayers: 3,
       isHost: false,
       status: "offline",
       lobbyPlayers: [],
       localDisplayName: "",
+      pendingInviteCode: "",
+      pendingInviteToken: "",
+      pendingInviteError: null,
       error: null,
     },
   },
@@ -68,6 +73,7 @@ const gameEngine = new GameEngine({
 
 const authManager = new AuthManager({ eventBus, stateManager });
 const onlineEngine = new OnlineEngine({ eventBus, stateManager, gameEngine, authManager });
+onlineEngine.hydrateInviteFromUrl();
 
 const uiEngine = new UIEngine({
   root: document.getElementById("screen-root"),

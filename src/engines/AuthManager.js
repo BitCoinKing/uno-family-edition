@@ -64,7 +64,9 @@ export class AuthManager {
   async signInWithProvider(provider) {
     if (!this.supabase) return { ok: false, error: "Supabase is not configured." };
 
-    const redirectTo = `${window.location.origin}`;
+    const redirectUrl = new URL(window.location.href);
+    redirectUrl.hash = "";
+    const redirectTo = redirectUrl.toString();
     const { error } = await this.supabase.auth.signInWithOAuth({
       provider,
       options: { redirectTo },
