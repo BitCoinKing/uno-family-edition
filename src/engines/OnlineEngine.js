@@ -54,6 +54,8 @@ export class OnlineEngine {
     this.autoStartInFlight = false;
     this.pullRoomStateInFlight = false;
     this.activeStatePullTimer = null;
+    this.uiStatusTimer = null;
+    this.activeTransitionTimer = null;
 
     this.eventBus.on("auth:changed", async () => {
       await this.refreshLobby();
@@ -83,6 +85,24 @@ export class OnlineEngine {
     this.gameEngine.updateSetup({
       online: merged,
     });
+  }
+
+  setTransientUiStatus(message, durationMs = 900) {
+    if (this.uiStatusTimer) {
+      clearTimeout(this.uiStatusTimer);
+      this.uiStatusTimer = null;
+    }
+
+    this.patchSetup({ uiStatus: message });
+    if (!durationMs || durationMs <= 0) return;
+
+    this.uiStatusTimer = setTimeout(() => {
+      this.uiStatusTimer = null;
+      const online = this.stateManager.getState().setup.online;
+      if (online.uiStatus === message) {
+        this.patchSetup({ uiStatus: null });
+      }
+    }, durationMs);
   }
 
   syncSetupForExpectedPlayers(expectedPlayers) {
@@ -338,7 +358,12 @@ export class OnlineEngine {
       pendingInviteError: null,
     });
 
+    if (snapshot?.room?.status !== "active") {
+      this.setTransientUiStatus("Joined ✅ Waiting for host…", 900);
+    }
+
     if (snapshot?.room?.status === "active") {
+      this.setTransientUiStatus("Starting match…", 500);
       await this.pullRoomState(room.id);
     }
 
@@ -470,34 +495,68 @@ export class OnlineEngine {
       clearTimeout(this.activeStatePullTimer);
       this.activeStatePullTimer = null;
     }
+    if (this.uiStatusTimer) {
+      clearTimeout(this.uiStatusTimer);
+      this.uiStatusTimer = null;
+    }
+    if (this.activeTransitionTimer) {
+      clearTimeout(this.activeTransitionTimer);
+      this.activeTransitionTimer = null;
+    }
     this.channel = null;
     this.activeRoom = null;
   }
 
   async onRoomUpdated(room) {
+    const state = this.stateManager.getState();
+    const previousStatus = state.setup.online.status;
+    const becameActive = previousStatus !== "active" && room.status === "active";
+
     if (this.activeRoom && this.activeRoom.id === room.id) {
       this.activeRoom.version = room.version || this.activeRoom.version || 0;
     }
     this.patchSetup({ status: room.status, roomCode: room.code, expectedPlayers: room.expected_players });
     this.syncSetupForExpectedPlayers(room.expected_players);
+
+    if (becameActive) {
+      this.setTransientUiStatus("Starting match…", 500);
+    }
+
     if (room.game_state) {
-      this.gameEngine.applyRemoteGameState(room.game_state, "game:synced");
+      const shouldDelayTransition = becameActive && state.screen !== "game";
+      if (shouldDelayTransition) {
+        if (this.activeTransitionTimer) {
+          clearTimeout(this.activeTransitionTimer);
+        }
+        this.activeTransitionTimer = setTimeout(() => {
+          this.activeTransitionTimer = null;
+          this.gameEngine.applyRemoteGameState(room.game_state, "game:synced");
+        }, 420);
+      } else {
+        if (this.activeTransitionTimer) {
+          clearTimeout(this.activeTransitionTimer);
+          this.activeTransitionTimer = null;
+        }
+        this.gameEngine.applyRemoteGameState(room.game_state, "game:synced");
+      }
       return;
     }
 
     if (room.status === "active") {
-      this.scheduleActiveStatePull();
+      this.scheduleActiveStatePull(becameActive ? 420 : 150);
     }
   }
 
-  scheduleActiveStatePull() {
-    if (this.activeStatePullTimer) return;
+  scheduleActiveStatePull(delayMs = 150) {
+    if (this.activeStatePullTimer) {
+      clearTimeout(this.activeStatePullTimer);
+    }
     this.activeStatePullTimer = setTimeout(async () => {
       this.activeStatePullTimer = null;
       const roomId = this.stateManager.getState().setup.online.roomId || this.activeRoom?.id;
       if (!roomId) return;
       await this.pullRoomState(roomId);
-    }, 150);
+    }, delayMs);
   }
 
   async onMoveIntent(payload) {
@@ -575,6 +634,10 @@ export class OnlineEngine {
         .single();
 
       if (room?.game_state) {
+        if (this.activeTransitionTimer) {
+          clearTimeout(this.activeTransitionTimer);
+          this.activeTransitionTimer = null;
+        }
         this.gameEngine.applyRemoteGameState(room.game_state, "game:synced");
       }
     } finally {

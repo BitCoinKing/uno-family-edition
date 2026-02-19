@@ -49,7 +49,7 @@ export class UIEngine {
     this.eventBus.on("game:drawn", () => this.updateGame());
     this.eventBus.on("game:turnEnded", () => this.updateGame());
     this.eventBus.on("game:won", () => this.updateGame());
-    this.eventBus.on("game:synced", () => this.updateGame());
+    this.eventBus.on("game:synced", () => this.handleGameSynced());
     this.eventBus.on("ui:changed", () => this.updateOverlays());
     this.eventBus.on("game:left", () => this.renderScreen());
     this.eventBus.on("stats:updated", () => this.updateScoreboardTable());
@@ -462,6 +462,9 @@ export class UIEngine {
       : waitingFor === 0
         ? (online.isHost ? "Starting game..." : "Waiting for host to start...")
         : `Waiting for ${waitingFor} more player${waitingFor === 1 ? "" : "s"}...`;
+    const uiStatusLine = online.uiStatus
+      ? `<p class="small-text">${online.uiStatus}</p>`
+      : "";
     const roomControls = online.roomId
       ? `<p class="small-text">Connected to room. Share invite link or wait in lobby.</p>`
       : `
@@ -476,6 +479,7 @@ export class UIEngine {
       <div class="online-card">
         <h3>Online Lobby</h3>
         <p class="small-text">Status: ${online.status || "offline"} ${online.loading ? "(loading...)" : ""}</p>
+        ${uiStatusLine}
         <p class="small-text">Players Joined: ${joinedCount} / ${expectedPlayers}</p>
         <p class="small-text">${waitingCopy}</p>
         ${pendingInviteNotice}
@@ -504,6 +508,14 @@ export class UIEngine {
         <ul class="lobby-list">${lobbyRows}</ul>
       </div>
     `;
+  }
+
+  handleGameSynced() {
+    const state = this.stateManager.getState();
+    if (state.screen === "game" && !this.nodes.playersGrid) {
+      this.renderScreen();
+    }
+    this.updateGame();
   }
 
   bindGameEvents() {

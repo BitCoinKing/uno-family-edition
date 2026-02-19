@@ -203,6 +203,7 @@ export class GameEngine {
 
   applyRemoteGameState(remoteGame, eventName = "game:synced") {
     if (!remoteGame) return;
+    const previousScreen = this.stateManager.getState().screen;
     const game = JSON.parse(JSON.stringify(remoteGame));
     this.stateManager.setState((state) => ({
       ...state,
@@ -215,6 +216,9 @@ export class GameEngine {
           : `Turn: ${game.players[game.currentTurn]?.name || "-"}`,
       },
     }), eventName);
+    if (previousScreen !== "game") {
+      this.eventBus.emit("screen:changed");
+    }
 
     if (game.winnerId) {
       const winner = game.players.find((p) => p.id === game.winnerId);

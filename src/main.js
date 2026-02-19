@@ -35,6 +35,7 @@ const initialState = {
       status: "offline",
       lobbyPlayers: [],
       localDisplayName: "",
+      uiStatus: null,
       pendingInviteCode: "",
       pendingInviteToken: "",
       pendingInviteError: null,
