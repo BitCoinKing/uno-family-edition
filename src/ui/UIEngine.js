@@ -243,6 +243,12 @@ export class UIEngine {
         return;
       }
 
+      if (action === "auth-apple") {
+        const result = await this.authManager.signInWithApple();
+        if (!result.ok) this.nodes.error.textContent = result.error;
+        return;
+      }
+
       if (action === "auth-logout") {
         const result = await this.authManager.signOut();
         if (!result.ok) this.nodes.error.textContent = result.error;
@@ -375,7 +381,10 @@ export class UIEngine {
             : auth.user
               ? `<p class='small-text'>Signed in as <strong>${auth.user.email || auth.user.id}</strong></p>
                  <button class='btn ghost' data-online-action='auth-logout'>Sign Out</button>`
-              : "<button class='btn primary' data-online-action='auth-google'>Sign in with Google</button>"
+              : `<div class="auth-provider-row">
+                   <button class='btn primary' data-online-action='auth-google'>Sign in with Google</button>
+                   <button class='btn ghost' data-online-action='auth-apple'>Sign in with Apple</button>
+                 </div>`
         }
 
         <div class="online-controls">

@@ -54,11 +54,19 @@ export class AuthManager {
   }
 
   async signInWithGoogle() {
+    return this.signInWithProvider("google");
+  }
+
+  async signInWithApple() {
+    return this.signInWithProvider("apple");
+  }
+
+  async signInWithProvider(provider) {
     if (!this.supabase) return { ok: false, error: "Supabase is not configured." };
 
     const redirectTo = `${window.location.origin}`;
     const { error } = await this.supabase.auth.signInWithOAuth({
-      provider: "google",
+      provider,
       options: { redirectTo },
     });
 

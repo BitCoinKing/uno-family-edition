@@ -150,6 +150,12 @@ body::after {
   margin: 0;
 }
 
+.auth-provider-row {
+  display: flex;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
 .small-text {
   margin: 0;
   color: #c6ddf1;
