@@ -734,22 +734,63 @@ export class OnlineEngine {
       return { ok: false, error: "Client state is stale." };
     }
 
+    const actorUserId = intent.actorUserId || null;
+    const actorPlayerIndex = actorUserId
+      ? game.players.findIndex((player) => player.userId === actorUserId)
+      : -1;
+    if (actorUserId && actorPlayerIndex < 0) {
+      await this.broadcastIntentRejected(intent.actorUserId, {
+        ref: intent.ref || null,
+        reason: "invalid_move",
+        error: "You are not seated in this room.",
+      });
+      return { ok: false, error: "You are not seated in this room." };
+    }
+
+    const actorPlayerId = actorPlayerIndex >= 0 ? game.players[actorPlayerIndex].id : null;
+    if (actorPlayerId && intent.playerId && intent.playerId !== actorPlayerId) {
+      console.log("[ONLINE][intent:seat-mismatch]", {
+        roomId: this.activeRoom?.id || null,
+        actorUserId,
+        expectedPlayerId: actorPlayerId,
+        requestedPlayerId: intent.playerId,
+      });
+    }
+
+    const resolvedPlayerId = actorPlayerId || intent.playerId;
+    if (!resolvedPlayerId) {
+      await this.broadcastIntentRejected(intent.actorUserId, {
+        ref: intent.ref || null,
+        reason: "invalid_move",
+        error: "Missing player identity.",
+      });
+      return { ok: false, error: "Missing player identity." };
+    }
+
     let result = { ok: false };
 
     if (intent.type === "play") {
       result = this.gameEngine.playCard({
-        playerId: intent.playerId,
+        playerId: resolvedPlayerId,
         cardId: intent.cardId,
         declaredColor: intent.declaredColor,
       });
     }
 
     if (intent.type === "draw") {
-      result = this.gameEngine.drawCard(intent.playerId, { passTurn: true });
+      result = this.gameEngine.drawCard(resolvedPlayerId);
     }
 
     if (intent.type === "pass") {
-      result = this.gameEngine.endTurn(intent.playerId, "pass");
+      result = this.gameEngine.endTurn(resolvedPlayerId, "pass");
+    }
+
+    if (intent.type === "call_uno") {
+      result = this.gameEngine.callUno(resolvedPlayerId);
+    }
+
+    if (!["play", "draw", "pass", "call_uno"].includes(intent.type)) {
+      result = { ok: false, error: "Unknown intent type." };
     }
 
     if (!result.ok) {
@@ -816,6 +857,8 @@ export class OnlineEngine {
       version: this.activeRoom.version,
       status: data?.status || status,
       currentTurn: game.currentTurn,
+      activeColor: game.activeColor,
+      discardTop: game.discardTop?.value ?? game.discardPile?.[game.discardPile.length - 1]?.value ?? null,
     });
     return { ok: true, version: this.activeRoom.version };
   }
@@ -1004,5 +1047,9 @@ export class OnlineEngine {
 
   async requestPass({ playerId, clientRoomVersion }) {
     return this.sendIntent({ type: "pass", playerId, clientRoomVersion });
+  }
+
+  async requestCallUno({ playerId, clientRoomVersion }) {
+    return this.sendIntent({ type: "call_uno", playerId, clientRoomVersion });
   }
 }

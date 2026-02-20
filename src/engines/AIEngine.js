@@ -22,22 +22,27 @@ export class AIEngine {
     const player = game.players[game.currentTurn];
     if (!player || player.id !== playerId || !player.isAI) return;
 
-    const playable = player.hand.filter((card) => this.gameEngine.isPlayable(card, game));
+    const playable = player.hand.filter((card) => this.gameEngine.isPlayable(card, game, player));
 
     if (playable.length === 0) {
-      const drawResult = this.gameEngine.drawCard(playerId, { passTurn: false });
+      const drawResult = this.gameEngine.drawCard(playerId);
       if (!drawResult.ok) return;
 
-      const drawnCard = drawResult.card;
-      if (drawnCard && this.gameEngine.isPlayable(drawnCard, this.stateManager.getState().game)) {
-        const color = drawnCard.type === "wild" ? this.pickColor(player.hand) : null;
-        this.gameEngine.playCard({
+      if (drawResult.turnEnded) return;
+
+      const refreshed = this.stateManager.getState().game;
+      const refreshedPlayer = refreshed?.players?.find((entry) => entry.id === playerId);
+      const drawnCard = refreshedPlayer?.hand?.find((card) => card.id === drawResult.card?.id);
+
+      if (drawnCard && this.gameEngine.isPlayable(drawnCard, refreshed, refreshedPlayer)) {
+        const color = drawnCard.type === "wild" ? this.pickColor(refreshedPlayer.hand) : null;
+        const playResult = this.gameEngine.playCard({
           playerId,
           cardId: drawnCard.id,
           declaredColor: color,
         });
-      } else {
-        this.gameEngine.endTurn(playerId, "pass");
+        if (playResult.ok) this.tryCallUno(playerId);
+        return;
       }
       return;
     }
@@ -45,11 +50,20 @@ export class AIEngine {
     const chosen = this.chooseCard(playable, game);
     const declaredColor = chosen.type === "wild" ? this.pickColor(player.hand) : null;
 
-    this.gameEngine.playCard({
+    const result = this.gameEngine.playCard({
       playerId,
       cardId: chosen.id,
       declaredColor,
     });
+    if (result.ok) this.tryCallUno(playerId);
+  }
+
+  tryCallUno(playerId) {
+    const game = this.stateManager.getState().game;
+    if (!game || game.winnerId) return;
+    const player = game.players.find((entry) => entry.id === playerId);
+    if (!player?.mustCallUno) return;
+    this.gameEngine.callUno(playerId);
   }
 
   chooseCard(cards, game) {

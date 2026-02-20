@@ -464,6 +464,18 @@ button {
   gap: 0.55rem;
 }
 
+.turn-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.turn-actions .btn {
+  min-width: 88px;
+}
+
 .deck-card {
   width: 100px;
   height: 140px;

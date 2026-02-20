@@ -49,6 +49,8 @@ export class UIEngine {
     this.eventBus.on("game:drawn", () => this.updateGame());
     this.eventBus.on("game:turnEnded", () => this.updateGame());
     this.eventBus.on("game:won", () => this.updateGame());
+    this.eventBus.on("game:unoCalled", () => this.updateGame());
+    this.eventBus.on("game:unoPenalty", () => this.updateGame());
     this.eventBus.on("game:synced", () => this.handleGameSynced());
     this.eventBus.on("ui:changed", () => this.updateOverlays());
     this.eventBus.on("game:left", () => this.renderScreen());
@@ -170,6 +172,10 @@ export class UIEngine {
           <section id="players-grid" class="players-grid"></section>
           <section class="center-zone">
             <button id="draw-card" class="deck-card">Draw</button>
+            <div class="turn-actions">
+              <button id="pass-turn" class="btn ghost">Pass</button>
+              <button id="call-uno" class="btn danger">UNO!</button>
+            </div>
             <div id="discard-card" class="uno-card discard-card">?</div>
             <p id="pile-meta" class="pile-meta">Deck: 0</p>
           </section>
@@ -199,6 +205,8 @@ export class UIEngine {
     this.nodes.turnBanner = this.root.querySelector("#turn-banner");
     this.nodes.playersGrid = this.root.querySelector("#players-grid");
     this.nodes.drawCard = this.root.querySelector("#draw-card");
+    this.nodes.passTurn = this.root.querySelector("#pass-turn");
+    this.nodes.callUno = this.root.querySelector("#call-uno");
     this.nodes.discardCard = this.root.querySelector("#discard-card");
     this.nodes.pileMeta = this.root.querySelector("#pile-meta");
     this.nodes.directionPill = this.root.querySelector("#direction-pill");
@@ -581,9 +589,87 @@ export class UIEngine {
 
       const player = game.players[game.currentTurn];
       if (!player || player.isAI) return;
-      const result = this.gameEngine.drawCard(player.id, { passTurn: true });
+      const result = this.gameEngine.drawCard(player.id);
       if (!result.ok) {
         this.showToast(result.error || "Could not draw card.");
+      }
+    });
+
+    this.nodes.passTurn?.addEventListener("click", async () => {
+      const game = this.stateManager.getState().game;
+      if (!game || game.winnerId) return;
+
+      if (game.mode === "online") {
+        const turn = await this.ensureOnlineTurn(game);
+        if (!turn.ok) {
+          this.showToast(turn.error || "Not your turn.");
+          return;
+        }
+
+        if (!turn.game?.turnState?.hasDrawnThisTurn) {
+          this.showToast("Draw first before passing.");
+          return;
+        }
+
+        const result = await this.onlineEngine.requestPass({
+          playerId: turn.localPlayer.id,
+          clientRoomVersion: this.onlineEngine.getRoomVersion(),
+        });
+        if (!result?.ok) {
+          this.showToast(result?.error || "Could not pass turn.");
+        }
+        return;
+      }
+
+      const player = game.players[game.currentTurn];
+      if (!player || player.isAI) return;
+      const result = this.gameEngine.endTurn(player.id, "pass");
+      if (!result.ok) {
+        this.showToast(result.error || "Could not pass turn.");
+      }
+    });
+
+    this.nodes.callUno?.addEventListener("click", async () => {
+      const game = this.stateManager.getState().game;
+      if (!game || game.winnerId) return;
+
+      if (game.mode === "online") {
+        let activeGame = game;
+        let localPlayer = this.getLocalPlayer(activeGame);
+        if (!localPlayer) {
+          await this.onlineEngine.pullRoomState();
+          activeGame = this.stateManager.getState().game;
+          localPlayer = this.getLocalPlayer(activeGame);
+        }
+
+        if (!localPlayer) {
+          this.showToast("You are not seated in this room.");
+          return;
+        }
+
+        if (!localPlayer.mustCallUno) {
+          this.showToast("UNO call is not needed now.");
+          return;
+        }
+
+        const result = await this.onlineEngine.requestCallUno({
+          playerId: localPlayer.id,
+          clientRoomVersion: this.onlineEngine.getRoomVersion(),
+        });
+        if (!result?.ok) {
+          this.showToast(result?.error || "Could not call UNO.");
+        }
+        return;
+      }
+
+      const pendingPlayerId = game.pendingUnoPlayerId;
+      if (!pendingPlayerId) {
+        this.showToast("UNO call is not needed now.");
+        return;
+      }
+      const result = this.gameEngine.callUno(pendingPlayerId);
+      if (!result.ok) {
+        this.showToast(result.error || "Could not call UNO.");
       }
     });
 
@@ -612,7 +698,7 @@ export class UIEngine {
           this.showToast("Hand updated. Tap your card again.");
           return;
         }
-        if (!this.gameEngine.isPlayable(card, activeGame)) {
+        if (!this.gameEngine.isPlayable(card, activeGame, localPlayer)) {
           this.showToast("That card cannot be played now.");
           return;
         }
@@ -647,7 +733,7 @@ export class UIEngine {
         this.showToast("Card not found in hand.");
         return;
       }
-      if (!this.gameEngine.isPlayable(card, game)) {
+      if (!this.gameEngine.isPlayable(card, game, player)) {
         this.showToast("That card cannot be played now.");
         return;
       }
@@ -735,18 +821,43 @@ export class UIEngine {
     const isMyTurn = game.mode === "online" ? this.isLocalUsersTurn(game) : true;
 
     this.nodes.directionPill.textContent = `Direction: ${game.direction === 1 ? "Clockwise" : "Counterclockwise"}`;
-    this.nodes.pileMeta.textContent = `Deck: ${game.drawPile.length}`;
+    this.nodes.pileMeta.textContent = `Deck: ${game.drawPile.length} • Active: ${(game.activeColor || "-").toUpperCase()}`;
 
     const top = game.discardPile[game.discardPile.length - 1];
     this.nodes.discardCard.className = `uno-card discard-card ${top.selectedColor || top.color}`;
     this.nodes.discardCard.innerHTML = this.cardInner(top, true);
 
     const current = game.players[game.currentTurn];
+    const turnState = game.turnState || {};
+    const localPlayer = game.mode === "online" ? this.getLocalPlayer(game) : current;
+    const canLocalDraw = !!localPlayer
+      && !localPlayer.isAI
+      && !game.winnerId
+      && (game.mode === "online" ? true : !current.isAI && isMyTurn)
+      && !turnState.hasDrawnThisTurn;
+    const canLocalPass = !!localPlayer
+      && !localPlayer.isAI
+      && !game.winnerId
+      && (game.mode === "online" ? isMyTurn : !current.isAI)
+      && !!turnState.hasDrawnThisTurn;
+    const canLocalCallUno = !!localPlayer
+      && !game.winnerId
+      && !!localPlayer.mustCallUno
+      && game.pendingUnoPlayerId === localPlayer.id;
+
+    if (this.nodes.drawCard) {
+      this.nodes.drawCard.disabled = !canLocalDraw;
+      this.nodes.drawCard.textContent = turnState.hasDrawnThisTurn ? "Drawn" : "Draw";
+    }
+    if (this.nodes.passTurn) {
+      this.nodes.passTurn.disabled = !canLocalPass;
+    }
+    if (this.nodes.callUno) {
+      this.nodes.callUno.disabled = !canLocalCallUno;
+    }
+
     if (game.mode === "online") {
-      const localPlayer = this.getLocalPlayer(game);
-      this.nodes.drawCard.disabled = !!game.winnerId || !localPlayer || localPlayer.isAI;
-    } else {
-      this.nodes.drawCard.disabled = !!game.winnerId || current.isAI || !isMyTurn;
+      this.logOnlineTurnDebug(game, localPlayer);
     }
 
     this.nodes.playersGrid.innerHTML = game.players
@@ -772,7 +883,7 @@ export class UIEngine {
     const canShowCards = isLocalPlayer && !player.isAI && !game.winnerId;
     const cards = canShowCards
       ? player.hand.map((card, cardIndex) => {
-          const playable = isActive && isMyTurn && this.gameEngine.isPlayable(card, game);
+          const playable = isActive && isMyTurn && this.gameEngine.isPlayable(card, game, player);
           const mid = (player.hand.length - 1) / 2;
           const fanAngle = `${(cardIndex - mid) * 4}deg`;
           const fanLift = `${Math.abs(cardIndex - mid) * -1.2}px`;
@@ -837,6 +948,16 @@ export class UIEngine {
       return;
     }
 
+    if (payload.action === "uno") {
+      this.showToast(payload.text);
+      return;
+    }
+
+    if (payload.action === "uno_penalty") {
+      this.particleEngine.emitSkipPulse(x, y);
+      return;
+    }
+
     this.particleEngine.emitCardBurst(x, y, color);
 
     if (payload.action === "reverse") {
@@ -863,9 +984,8 @@ export class UIEngine {
     this.animationEngine.zoomTurnBanner(this.nodes.turnBanner);
 
     const game = this.stateManager.getState().game;
-    const localUserId = this.getLocalUserId();
     const isLocalTurn = game?.mode === "online"
-      ? !!localUserId && payload.userId === localUserId
+      ? this.isLocalUsersTurn(game)
       : !payload.isAI;
 
     if (isLocalTurn) {
@@ -1112,6 +1232,8 @@ export class UIEngine {
       localPlayerIndex: pinnedIndex,
       myIndex,
       currentTurn: game.currentTurn,
+      activeColor: game.activeColor || null,
+      discardTop: game.discardPile?.[game.discardPile.length - 1]?.value ?? null,
       myUserId: localUserId,
       currentUserIdInTurn: game.players[game.currentTurn]?.userId || null,
     });
