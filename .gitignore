@@ -3,3 +3,6 @@
 .env.local
 .vercel
 node_modules
+tests/.auth
+test-results
+playwright-report

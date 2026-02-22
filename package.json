@@ -5,6 +5,14 @@
   "version": "1.1.0",
   "scripts": {
     "dev": "vercel dev",
-    "serve": "python3 -m http.server 4173"
+    "serve": "python3 -m http.server 4173",
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed",
+    "test:e2e:online": "playwright test tests/e2e/online-multiplayer.spec.js",
+    "e2e:auth:host": "node scripts/save-auth-state.mjs --out tests/.auth/host.json --label host",
+    "e2e:auth:joiner": "node scripts/save-auth-state.mjs --out tests/.auth/joiner.json --label joiner"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2"
   }
 }
