@@ -57,6 +57,7 @@ export class OnlineEngine {
     this.pullRoomStateQueued = false;
     this.pullRoomStateQueuedRoomId = null;
     this.uiStatusTimer = null;
+    this.roomSyncIntervalId = null;
 
     this.eventBus.on("auth:changed", async () => {
       await this.refreshLobby();
@@ -86,11 +87,69 @@ export class OnlineEngine {
     this.patchSetup({ lastSeenVersion: next });
   }
 
+  hydratePlayerUserIdsFromLobby(game) {
+    if (!game || !Array.isArray(game.players)) return;
+    const lobbyPlayers = this.stateManager.getState().setup.online.lobbyPlayers || [];
+    if (!Array.isArray(lobbyPlayers) || lobbyPlayers.length === 0) return;
+
+    const byIndex = new Map();
+    lobbyPlayers.forEach((entry) => {
+      const index = Number(entry.player_index);
+      if (Number.isInteger(index) && index >= 0) {
+        byIndex.set(index, entry);
+      }
+    });
+
+    game.players.forEach((player, index) => {
+      if (player.userId) return;
+      const lobby = byIndex.get(index);
+      if (lobby?.user_id) {
+        player.userId = lobby.user_id;
+      }
+    });
+  }
+
+  resolveLocalSeatFromLobby(
+    game,
+    { userId = null, allowDisplayNameFallback = true } = {},
+  ) {
+    if (!game || !Array.isArray(game.players) || game.players.length === 0) return null;
+
+    const online = this.stateManager.getState().setup.online;
+    const lobbyPlayers = Array.isArray(online.lobbyPlayers) ? online.lobbyPlayers : [];
+    if (lobbyPlayers.length > 0) {
+      if (userId) {
+        const lobbyMatch = lobbyPlayers.find((entry) => entry.user_id === userId);
+        const lobbyIndex = Number(lobbyMatch?.player_index);
+        if (Number.isInteger(lobbyIndex) && lobbyIndex >= 0 && game.players[lobbyIndex]) {
+          return { index: lobbyIndex, id: game.players[lobbyIndex].id };
+        }
+      }
+
+      if (allowDisplayNameFallback) {
+        const displayName = (online.localDisplayName || "").trim().toLowerCase();
+        if (displayName) {
+          const lobbyByName = lobbyPlayers.find((entry) =>
+            (entry.display_name || "").trim().toLowerCase() === displayName
+          );
+          const lobbyIndex = Number(lobbyByName?.player_index);
+          if (Number.isInteger(lobbyIndex) && lobbyIndex >= 0 && game.players[lobbyIndex]) {
+            return { index: lobbyIndex, id: game.players[lobbyIndex].id };
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
   syncLocalSeatFromGame(game) {
     if (!game || game.mode !== "online") {
       this.patchSetup({ localPlayerId: null, localPlayerIndex: null });
       return;
     }
+
+    this.hydratePlayerUserIdsFromLobby(game);
 
     const localUserId = this.authManager.getUser()?.id;
     if (!localUserId) {
@@ -98,8 +157,16 @@ export class OnlineEngine {
       return;
     }
 
-    const localPlayerIndex = game.players.findIndex((player) => player.userId === localUserId);
-    const localPlayerId = localPlayerIndex >= 0 ? game.players[localPlayerIndex].id : null;
+    let localPlayerIndex = game.players.findIndex((player) => player.userId === localUserId);
+    let localPlayerId = localPlayerIndex >= 0 ? game.players[localPlayerIndex].id : null;
+
+    if (localPlayerIndex < 0) {
+      const fallback = this.resolveLocalSeatFromLobby(game, { userId: localUserId });
+      if (fallback) {
+        localPlayerIndex = fallback.index;
+        localPlayerId = fallback.id;
+      }
+    }
 
     this.patchSetup({
       localPlayerId,
@@ -113,6 +180,25 @@ export class OnlineEngine {
       localPlayerIndex: localPlayerIndex >= 0 ? localPlayerIndex : null,
       currentTurn: game.currentTurn,
     });
+  }
+
+  startRoomSyncLoop(roomId) {
+    this.stopRoomSyncLoop();
+    if (!roomId) return;
+
+    this.roomSyncIntervalId = setInterval(async () => {
+      const online = this.stateManager.getState().setup.online;
+      if (!this.activeRoom || this.activeRoom.id !== roomId) return;
+      if (online.status !== "active") return;
+      await this.pullRoomState(roomId);
+    }, 1800);
+  }
+
+  stopRoomSyncLoop() {
+    if (this.roomSyncIntervalId) {
+      clearInterval(this.roomSyncIntervalId);
+      this.roomSyncIntervalId = null;
+    }
   }
 
   patchSetup(patch) {
@@ -568,12 +654,14 @@ export class OnlineEngine {
     });
 
     await this.pullRoomState(room.id);
+    this.startRoomSyncLoop(room.id);
   }
 
   async teardownRoom() {
     if (this.channel && this.supabase) {
       await this.supabase.removeChannel(this.channel);
     }
+    this.stopRoomSyncLoop();
     if (this.uiStatusTimer) {
       clearTimeout(this.uiStatusTimer);
       this.uiStatusTimer = null;
@@ -734,10 +822,22 @@ export class OnlineEngine {
       return { ok: false, error: "Client state is stale." };
     }
 
+    this.hydratePlayerUserIdsFromLobby(game);
+
     const actorUserId = intent.actorUserId || null;
-    const actorPlayerIndex = actorUserId
+    let actorPlayerIndex = actorUserId
       ? game.players.findIndex((player) => player.userId === actorUserId)
       : -1;
+
+    if (actorPlayerIndex < 0 && actorUserId) {
+      const fallback = this.resolveLocalSeatFromLobby(game, {
+        userId: actorUserId,
+        allowDisplayNameFallback: false,
+      });
+      if (fallback) {
+        actorPlayerIndex = fallback.index;
+      }
+    }
     if (actorUserId && actorPlayerIndex < 0) {
       await this.broadcastIntentRejected(intent.actorUserId, {
         ref: intent.ref || null,

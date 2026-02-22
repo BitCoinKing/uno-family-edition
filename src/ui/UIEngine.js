@@ -37,6 +37,7 @@ export class UIEngine {
     this.pendingWild = null;
     this.feedbackTimer = null;
     this.lastSetupCount = null;
+    this.lastSeatSyncAttemptAt = 0;
 
     this.bindEvents();
   }
@@ -829,7 +830,16 @@ export class UIEngine {
 
     const current = game.players[game.currentTurn];
     const turnState = game.turnState || {};
-    const localPlayer = game.mode === "online" ? this.getLocalPlayer(game) : current;
+    let localPlayer = game.mode === "online" ? this.getLocalPlayer(game) : current;
+    if (game.mode === "online" && !localPlayer) {
+      this.onlineEngine.syncLocalSeatFromGame(game);
+      localPlayer = this.getLocalPlayer(game);
+      const now = Date.now();
+      if (!localPlayer && now - this.lastSeatSyncAttemptAt > 1200) {
+        this.lastSeatSyncAttemptAt = now;
+        this.onlineEngine.pullRoomState();
+      }
+    }
     const canLocalDraw = !!localPlayer
       && !localPlayer.isAI
       && !game.winnerId
@@ -1111,6 +1121,32 @@ export class UIEngine {
     return Number.isFinite(index) && index >= 0 ? index : null;
   }
 
+  getLobbySeatIndex(game) {
+    if (!game || game.mode !== "online") return null;
+
+    const online = this.stateManager.getState().setup.online;
+    const lobbyPlayers = Array.isArray(online.lobbyPlayers) ? online.lobbyPlayers : [];
+    const localUserId = this.getLocalUserId();
+
+    if (localUserId) {
+      const byUser = lobbyPlayers.find((entry) => entry.user_id === localUserId);
+      const userIndex = Number(byUser?.player_index);
+      if (Number.isInteger(userIndex) && userIndex >= 0 && game.players[userIndex]) {
+        return userIndex;
+      }
+    }
+
+    const displayName = (online.localDisplayName || "").trim().toLowerCase();
+    if (!displayName) return null;
+    const byName = lobbyPlayers.find((entry) => (entry.display_name || "").trim().toLowerCase() === displayName);
+    const nameIndex = Number(byName?.player_index);
+    if (Number.isInteger(nameIndex) && nameIndex >= 0 && game.players[nameIndex]) {
+      return nameIndex;
+    }
+
+    return null;
+  }
+
   getLocalPlayer(game) {
     if (!game || game.mode !== "online") return null;
 
@@ -1126,9 +1162,17 @@ export class UIEngine {
     }
 
     const localUserId = this.getLocalUserId();
-    return localUserId
-      ? (game.players.find((player) => player.userId === localUserId) || null)
-      : null;
+    if (localUserId) {
+      const byUserId = game.players.find((player) => player.userId === localUserId) || null;
+      if (byUserId) return byUserId;
+    }
+
+    const lobbyIndex = this.getLobbySeatIndex(game);
+    if (lobbyIndex !== null && game.players[lobbyIndex]) {
+      return game.players[lobbyIndex];
+    }
+
+    return null;
   }
 
   isLocalPlayerSeat(player, game) {
@@ -1146,7 +1190,14 @@ export class UIEngine {
     }
 
     const localUserId = this.getLocalUserId();
-    return !!localUserId && player.userId === localUserId;
+    if (!!localUserId && player.userId === localUserId) return true;
+
+    const lobbyIndex = this.getLobbySeatIndex(game);
+    if (lobbyIndex !== null) {
+      return game.players[lobbyIndex]?.id === player.id;
+    }
+
+    return false;
   }
 
   isLocalUsersTurn(game) {
@@ -1166,11 +1217,16 @@ export class UIEngine {
 
     let localPlayer = this.getLocalPlayer(activeGame);
     if (!localPlayer) {
+      this.onlineEngine.syncLocalSeatFromGame(activeGame);
+      localPlayer = this.getLocalPlayer(activeGame);
+    }
+    if (!localPlayer) {
       await this.onlineEngine.pullRoomState();
       activeGame = this.stateManager.getState().game;
       if (!activeGame || activeGame.mode !== "online") {
         return { ok: false, error: "Game is syncing. Try again." };
       }
+      this.onlineEngine.syncLocalSeatFromGame(activeGame);
       localPlayer = this.getLocalPlayer(activeGame);
     }
 
@@ -1190,6 +1246,10 @@ export class UIEngine {
     }
 
     localPlayer = this.getLocalPlayer(refreshedGame);
+    if (!localPlayer) {
+      this.onlineEngine.syncLocalSeatFromGame(refreshedGame);
+      localPlayer = this.getLocalPlayer(refreshedGame);
+    }
     if (!localPlayer) {
       return { ok: false, error: "You are not seated in this room." };
     }
@@ -1214,9 +1274,19 @@ export class UIEngine {
     }
 
     const localUserId = this.getLocalUserId();
-    return !!localUserId
+    if (!!localUserId
       && player.userId === localUserId
-      && currentTurnPlayer.userId === localUserId;
+      && currentTurnPlayer.userId === localUserId) {
+      return true;
+    }
+
+    const lobbyIndex = this.getLobbySeatIndex(game);
+    if (lobbyIndex !== null) {
+      const lobbyPlayerId = game.players[lobbyIndex]?.id || null;
+      return player.id === lobbyPlayerId && currentTurnPlayer.id === lobbyPlayerId;
+    }
+
+    return false;
   }
 
   logOnlineTurnDebug(game, localPlayer) {
